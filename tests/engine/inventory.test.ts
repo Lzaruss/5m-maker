@@ -18,6 +18,8 @@ const cfg: MakerConfig = {
   adverseGuard: { btcReturn30sWiden: 0.0005, btcReturn30sPull: 0.001 },
   flattenBeforeSec: 20,
   flattenIfNetAboveUsd: 6.0,
+  fillParticipation: 1.0,
+  takerFeeMax: 0.018,
 };
 
 describe('applyFill', () => {

@@ -82,6 +82,12 @@ crypto/5m-maker/
 
 **Resolution capture:** after a window's resolve time, the recorder reads the outcome via Gamma `?clob_token_ids=<yesToken>` — `outcomePrices` converge to ~0/1 even while the market still reports `closed:false` (e.g. `["0.005","0.995"]` = Down won). It writes a `resolution` event (`yesWon`) so the simulator can settle leftover inventory at the real 0/1 rather than approximating. This cannot be reconstructed after the fact, so it must be recorded live.
 
+**Enriched tape (2026-05-25 review):** to enable studying the real picture, each tape line now also carries:
+- `market`: `rewardsMaxSpread`, `rewardsMinSize`, `gammaSpread` — the liquidity-rewards config and reference spread (from Gamma).
+- `book`: full depth `bids`/`asks` (top 10 levels each side as `[price, size]`) alongside the top-of-book scalars — for measuring competing liquidity within the reward band and queue position.
+
+These are additive (the scalar `bid`/`ask` fields are unchanged), so the current simulator keeps working without modification.
+
 ## 6. Pure engine contracts
 
 ```typescript
@@ -151,3 +157,15 @@ Engine functions are pure and tested exhaustively (quote placement, skew directi
 - Tick size per market: assumed 0.01; recorder will confirm from `tick_size_change` events.
 
 **Resolved during review (2026-05-25):** residual-inventory settlement now uses the real 0/1 outcome captured by the recorder (`resolution` events), with mark-to-mid only as a fallback when an outcome was not recorded.
+
+## 11. Research findings (2026-05-25) — to study before committing to a plan
+
+External research (Polymarket docs, the official `Polymarket/poly-market-maker` keeper, community write-ups) surfaced facts that may reframe the edge. **Recorded here for study; no paradigm change made yet.**
+
+- **5m crypto markets are in the Liquidity Rewards program.** Live sample: `rewardsMaxSpread = 4.5¢`, `rewardsMinSize = 50` shares; daily USDC payout with quadratic tightness scoring. Orders within 4.5¢ of mid and ≥50 shares earn rewards.
+- **The book is already ~1¢ tight** (`spread = 0.01`). Spread capture is therefore marginal; for these markets the dominant MM income is likely the **rewards**, not the spread.
+- **Sizing tension:** earning rewards needs ≥50-share orders (~$25 at price 0.5) — far above the current conservative `quote_size_usd: 3`, with a correspondingly larger inventory/capital profile.
+- **Fees:** makers pay $0 (and may earn rebates); takers on crypto pay up to 1.8% (modeled on flatten orders). The simulator does **not** yet model rewards income.
+- **5m is the hard case:** the official keeper syncs every 30s (built for long-lived markets); community notes that 5m favors aggressive taker entries due to adverse selection.
+
+**Implication for the study phase:** the current simulator measures spread P&L (marginal here) and ignores rewards (likely the real edge). Interpret current backtest numbers as a spread-only lower bound. Candidate next analyses (not yet built): model reward accrual from recorded depth + reward params; reassess order sizing and inventory limits.

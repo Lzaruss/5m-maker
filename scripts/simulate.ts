@@ -73,21 +73,30 @@ interface SimMetrics {
   flattens: number;
   heldResiduals: number;
   outcomeSettled: number; // windows whose residual was settled at real 0/1
+  takerFeesPaid: number; // total taker fees paid on flatten orders
+  byAsset: Map<string, { pnl: number; windows: number }>;
+  byHour: Map<number, { pnl: number; windows: number }>;
   pnls: number[]; // per-window
 }
 
-function newestTape(): string {
+function allTapes(): string[] {
   const dir = resolve('data');
   const files = readdirSync(dir)
     .filter((f) => f.startsWith('tape-') && f.endsWith('.jsonl'))
     .sort();
   if (files.length === 0) throw new Error('No tape-*.jsonl files in data/. Run `npm run record` first.');
-  return resolve(dir, files[files.length - 1]);
+  return files.map((f) => resolve(dir, f));
 }
 
-function loadWindows(path: string): Window[] {
-  const raw = readFileSync(path, 'utf8');
+function loadWindows(paths: string[]): Window[] {
   const byToken = new Map<string, Window>();
+  for (const path of paths) ingestTape(path, byToken);
+  // Keep only windows with a resolve time and at least some activity.
+  return [...byToken.values()].filter((w) => w.resolvesAt > 0 && w.events.length > 0);
+}
+
+function ingestTape(path: string, byToken: Map<string, Window>): void {
+  const raw = readFileSync(path, 'utf8');
   for (const line of raw.split('\n')) {
     const trimmed = line.trim();
     if (!trimmed) continue;
@@ -121,8 +130,13 @@ function loadWindows(path: string): Window[] {
     if (!w) continue; // no metadata yet -> can't compute time-to-resolve
     w.events.push(ev);
   }
-  // Keep only windows with a resolve time and at least some activity.
-  return [...byToken.values()].filter((w) => w.resolvesAt > 0 && w.events.length > 0);
+}
+
+/** Approximate Polymarket dynamic taker-fee factor: max at price 0.50, ~0 at
+ *  the extremes. fee = takerFeeMax * 2*min(p,1-p) * notional. */
+function takerFee(price: number, shares: number, maxRate: number): number {
+  const factor = 2 * Math.min(price, 1 - price);
+  return maxRate * factor * price * shares;
 }
 
 function simulate(windows: Window[], cfg: MakerConfig): SimMetrics {
@@ -139,19 +153,24 @@ function simulate(windows: Window[], cfg: MakerConfig): SimMetrics {
     flattens: 0,
     heldResiduals: 0,
     outcomeSettled: 0,
+    takerFeesPaid: 0,
+    byAsset: new Map(),
+    byHour: new Map(),
     pnls: [],
   };
 
   let invSampleSum = 0;
   let invSamples = 0;
+  const maxShares = (price: number) => cfg.maxInventoryUsd / price;
 
   for (const w of windows) {
     let inv: InventoryState = emptyInventory();
     let lastMid = 0;
     let lastBid = 0;
     let lastAsk = 0;
-    // Live resting quote with remaining size (consumed across trades until the
-    // next book refresh re-establishes it).
+    // Live resting quote. Size is consumed by fills and is only re-armed when
+    // the quote PRICE changes (a real cancel/replace that loses queue priority);
+    // an unchanged price keeps its already-consumed remaining (no free refill).
     let bidPrice: number | null = null;
     let bidRemaining = 0;
     let askPrice: number | null = null;
@@ -185,14 +204,21 @@ function simulate(windows: Window[], cfg: MakerConfig): SimMetrics {
         m.maxAbsInvUsd = Math.max(m.maxAbsInvUsd, Math.abs(invUsd));
 
         // Hybrid close: flatten large inventory at the touch once in the window.
+        // Crossing the book makes us a TAKER, so a dynamic taker fee applies.
         const close = closeGate(inv, lastMid, timeToResolveSec, cfg);
         if (close.action === 'flatten' && !flattened) {
           const qty = Math.abs(inv.shares);
           if (inv.shares > 0) {
             inv = applyFill(inv, { side: 'SELL', price: lastBid, shares: qty });
+            const fee = takerFee(lastBid, qty, cfg.takerFeeMax);
+            inv = { ...inv, cashUsd: inv.cashUsd - fee };
+            m.takerFeesPaid += fee;
             m.sellShares += qty;
           } else if (inv.shares < 0) {
             inv = applyFill(inv, { side: 'BUY', price: lastAsk, shares: qty });
+            const fee = takerFee(lastAsk, qty, cfg.takerFeeMax);
+            inv = { ...inv, cashUsd: inv.cashUsd - fee };
+            m.takerFeesPaid += fee;
             m.buyShares += qty;
           }
           flattened = true;
@@ -214,10 +240,25 @@ function simulate(windows: Window[], cfg: MakerConfig): SimMetrics {
         if (decision.action === 'quote') {
           if (decision.reason === 'pulled_one_side') m.pulledQuotes++;
           else if (decision.reason === 'widened') m.widenedQuotes++;
-          bidPrice = decision.bid?.price ?? null;
-          bidRemaining = decision.bid?.sizeShares ?? 0;
-          askPrice = decision.ask?.price ?? null;
-          askRemaining = decision.ask?.sizeShares ?? 0;
+          const newBid = decision.bid?.price ?? null;
+          const newAsk = decision.ask?.price ?? null;
+          // Re-arm size ONLY when the price changes (cancel/replace). An
+          // unchanged price keeps its already-consumed remaining — no free
+          // refill just because the book ticked.
+          if (newBid === null) {
+            bidPrice = null;
+            bidRemaining = 0;
+          } else if (newBid !== bidPrice) {
+            bidPrice = newBid;
+            bidRemaining = decision.bid?.sizeShares ?? 0;
+          }
+          if (newAsk === null) {
+            askPrice = null;
+            askRemaining = 0;
+          } else if (newAsk !== askPrice) {
+            askPrice = newAsk;
+            askRemaining = decision.ask?.sizeShares ?? 0;
+          }
         } else {
           bidPrice = askPrice = null;
           bidRemaining = askRemaining = 0;
@@ -231,19 +272,29 @@ function simulate(windows: Window[], cfg: MakerConfig): SimMetrics {
         if (p <= 0 || sz <= 0) continue;
         if (timeToResolveSec <= cfg.flattenBeforeSec) continue; // not quoting in flatten window
 
-        // A trade fills at most one of our sides (the one it crosses).
+        // We capture at most `fillParticipation` of the crossing trade size
+        // (queue-position proxy). A trade fills at most one of our sides.
+        const avail = sz * cfg.fillParticipation;
         if (bidPrice !== null && p <= bidPrice && bidRemaining > 0) {
-          const fillShares = Math.min(sz, bidRemaining);
-          inv = applyFill(inv, { side: 'BUY', price: bidPrice, shares: fillShares });
-          bidRemaining -= fillShares;
-          m.fills++;
-          m.buyShares += fillShares;
+          // Hard inventory clamp: never let a buy push net long past the cap.
+          const clamp = Math.max(0, maxShares(bidPrice) - inv.shares);
+          const fillShares = Math.min(avail, bidRemaining, clamp);
+          if (fillShares > 0) {
+            inv = applyFill(inv, { side: 'BUY', price: bidPrice, shares: fillShares });
+            bidRemaining -= fillShares;
+            m.fills++;
+            m.buyShares += fillShares;
+          }
         } else if (askPrice !== null && p >= askPrice && askRemaining > 0) {
-          const fillShares = Math.min(sz, askRemaining);
-          inv = applyFill(inv, { side: 'SELL', price: askPrice, shares: fillShares });
-          askRemaining -= fillShares;
-          m.fills++;
-          m.sellShares += fillShares;
+          // Hard inventory clamp: never let a sell push net short past the cap.
+          const clamp = Math.max(0, inv.shares + maxShares(askPrice));
+          const fillShares = Math.min(avail, askRemaining, clamp);
+          if (fillShares > 0) {
+            inv = applyFill(inv, { side: 'SELL', price: askPrice, shares: fillShares });
+            askRemaining -= fillShares;
+            m.fills++;
+            m.sellShares += fillShares;
+          }
         }
         continue;
       }
@@ -264,6 +315,18 @@ function simulate(windows: Window[], cfg: MakerConfig): SimMetrics {
     m.totalPnl += windowPnl;
     m.pnls.push(windowPnl);
     m.windows++;
+
+    // Breakdown by asset and by UTC hour (overfit / regime checks).
+    const a = m.byAsset.get(w.asset) ?? { pnl: 0, windows: 0 };
+    a.pnl += windowPnl;
+    a.windows++;
+    m.byAsset.set(w.asset, a);
+
+    const hour = new Date(w.resolvesAt).getUTCHours();
+    const h = m.byHour.get(hour) ?? { pnl: 0, windows: 0 };
+    h.pnl += windowPnl;
+    h.windows++;
+    m.byHour.set(hour, h);
   }
 
   m.meanAbsInvUsd = invSamples > 0 ? invSampleSum / invSamples : 0;
@@ -290,8 +353,20 @@ function report(label: string, m: SimMetrics): void {
   console.log(`quotes widened      : ${m.widenedQuotes}`);
   console.log(`quotes one-side pull: ${m.pulledQuotes}`);
   console.log(`flattens at close   : ${m.flattens}`);
+  console.log(`taker fees paid     : ${fmtUsd(-m.takerFeesPaid)} (on flattens; maker fills are free)`);
   console.log(`held residuals      : ${m.heldResiduals}`);
   console.log(`settled at real 0/1 : ${m.outcomeSettled}/${m.windows} (rest marked at mid)`);
+}
+
+function reportBreakdowns(m: SimMetrics): void {
+  console.log(`\n  -- P&L by asset --`);
+  for (const [asset, v] of [...m.byAsset.entries()].sort((a, b) => a[1].pnl - b[1].pnl)) {
+    console.log(`     ${asset.padEnd(5)} ${fmtUsd(v.pnl).padStart(10)}  (${v.windows} windows)`);
+  }
+  console.log(`  -- P&L by UTC hour --`);
+  for (const [hour, v] of [...m.byHour.entries()].sort((a, b) => a[0] - b[0])) {
+    console.log(`     ${String(hour).padStart(2)}:00 ${fmtUsd(v.pnl).padStart(10)}  (${v.windows} windows)`);
+  }
 }
 
 function fmtUsd(x: number): string {
@@ -303,17 +378,21 @@ function pct(a: number, b: number): string {
 
 function main(): void {
   const args = process.argv.slice(2);
-  let tapePath: string | null = null;
+  const tapePaths: string[] = [];
   let singleSpread: number | null = null;
   for (let i = 0; i < args.length; i++) {
     if (args[i] === '--spread') singleSpread = Number(args[++i]);
-    else if (!args[i].startsWith('--')) tapePath = resolve(args[i]);
+    else if (!args[i].startsWith('--')) tapePaths.push(resolve(args[i]));
   }
-  const path = tapePath ?? newestTape();
+  const paths = tapePaths.length ? tapePaths : allTapes();
 
   const cfg = loadBotYaml();
-  const windows = loadWindows(path);
-  console.log(`Loaded ${windows.length} market windows from ${path}`);
+  const windows = loadWindows(paths);
+  console.log(`Loaded ${windows.length} market windows from ${paths.length} tape(s):`);
+  for (const p of paths) console.log(`  - ${p}`);
+  console.log(
+    `Realism knobs: fill_participation=${cfg.maker.fillParticipation}, taker_fee_max=${cfg.maker.takerFeeMax}`,
+  );
   if (windows.length === 0) {
     console.log('No complete windows with metadata to simulate. Record more tape.');
     return;
@@ -322,14 +401,28 @@ function main(): void {
   if (singleSpread !== null) {
     const m = simulate(windows, { ...cfg.maker, halfSpread: singleSpread });
     report(`half_spread=${singleSpread}`, m);
+    reportBreakdowns(m);
     return;
   }
 
   // Sweep half_spread to see sensitivity and locate any profitable band.
   const spreads = [0.01, 0.02, 0.03, 0.04, 0.05, 0.07];
+  let bestPnl = -Infinity;
+  let bestSpread = spreads[0];
+  let bestMetrics: SimMetrics | null = null;
   for (const hs of spreads) {
     const m = simulate(windows, { ...cfg.maker, halfSpread: hs });
     report(`half_spread=${hs}`, m);
+    if (m.totalPnl > bestPnl) {
+      bestPnl = m.totalPnl;
+      bestSpread = hs;
+      bestMetrics = m;
+    }
+  }
+  // Asset/hour breakdown for the best spread (overfit / regime check).
+  if (bestMetrics) {
+    console.log(`\n### Breakdown for best spread (half_spread=${bestSpread}) ###`);
+    reportBreakdowns(bestMetrics);
   }
 }
 

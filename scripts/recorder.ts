@@ -25,6 +25,9 @@ import type { Asset } from '../src/util/assets.js';
 
 const WINDOW_MINUTES = 5;
 const POLL_MS = 20_000;
+// How many book levels per side to persist. The reward band is ~4.5c (≈5 ticks
+// at 1c), so 10 levels covers it with a buffer while bounding file growth.
+const BOOK_DEPTH_LEVELS = 10;
 // Subscribe to markets resolving within this horizon; keeps the active set
 // small and stable (avoids reconnecting the WS on every poll).
 const SUBSCRIBE_HORIZON_MS = 6 * 60_000;
@@ -42,10 +45,24 @@ interface TrackedMarket {
   resolved: boolean;
 }
 
+/** Optional run duration in ms from `--hours N` (or RECORD_HOURS env). */
+function parseDurationMs(): number | null {
+  const idx = process.argv.indexOf('--hours');
+  const raw = idx !== -1 ? process.argv[idx + 1] : process.env.RECORD_HOURS;
+  if (!raw) return null;
+  const hours = Number(raw);
+  if (!Number.isFinite(hours) || hours <= 0) return null;
+  return hours * 3600_000;
+}
+
 async function main(): Promise<void> {
   const cfg = loadBotYaml();
   const assets = cfg.assets;
-  logger.info({ assets }, 'Recorder starting');
+  const durationMs = parseDurationMs();
+  logger.info(
+    { assets, stopAfterHours: durationMs ? durationMs / 3600_000 : 'until Ctrl+C' },
+    'Recorder starting',
+  );
 
   mkdirSync(resolve('data'), { recursive: true });
   const date = new Date().toISOString().slice(0, 10);
@@ -77,10 +94,16 @@ async function main(): Promise<void> {
         t: 'book',
         ts: snap.ts,
         tokenId: snap.assetId,
+        // Top-of-book scalars (consumed by the current simulator).
         bid: bestBid?.price ?? null,
         bidSz: bestBid?.size ?? null,
         ask: bestAsk?.price ?? null,
         askSz: bestAsk?.size ?? null,
+        // Real book depth (top N levels each side) as [price, size] pairs, so we
+        // can later study competing liquidity within the reward band and queue
+        // position. Capped to bound file size.
+        bids: snap.bids.slice(0, BOOK_DEPTH_LEVELS).map((l) => [l.price, l.size]),
+        asks: snap.asks.slice(0, BOOK_DEPTH_LEVELS).map((l) => [l.price, l.size]),
         btcR30: asset ? priceFeed.getReturn(asset, 30) : null,
         btcPx: asset ? priceFeed.getLatestPrice(asset) : null,
       });
@@ -158,6 +181,10 @@ async function main(): Promise<void> {
           resolvesAt: tm.market.resolvesAt.getTime(),
           windowMinutes: tm.market.windowMinutes,
           question: tm.market.question,
+          // Liquidity-rewards config — needed to study the reward edge later.
+          rewardsMaxSpread: tm.market.rewardsMaxSpread,
+          rewardsMinSize: tm.market.rewardsMinSize,
+          gammaSpread: tm.market.gammaSpread,
         });
       }
 
@@ -171,15 +198,21 @@ async function main(): Promise<void> {
   await refresh();
   const interval = setInterval(refresh, POLL_MS);
 
-  const shutdown = () => {
-    logger.info({ lines, outPath }, 'Recorder shutting down');
+  let shuttingDown = false;
+  const shutdown = (why: string) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    logger.info({ lines, outPath, why }, 'Recorder shutting down');
     clearInterval(interval);
     feed.stop();
     priceFeed.stop();
     out.end(() => process.exit(0));
   };
-  process.on('SIGINT', shutdown);
-  process.on('SIGTERM', shutdown);
+  process.on('SIGINT', () => shutdown('SIGINT'));
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+
+  // Auto-stop after the requested duration, flushing the tape cleanly.
+  if (durationMs) setTimeout(() => shutdown('duration_reached'), durationMs);
 }
 
 main().catch((err) => {

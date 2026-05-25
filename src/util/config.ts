@@ -21,6 +21,12 @@ export interface MakerConfig {
   adverseGuard: AdverseGuardConfig;
   flattenBeforeSec: number;
   flattenIfNetAboveUsd: number;
+  /** Simulator only: fraction of a crossing trade's size we assume to capture
+   *  (queue-position proxy). 1.0 = front-of-line on the whole print. */
+  fillParticipation: number;
+  /** Simulator only: max crypto taker fee rate (at price 0.50). Maker fills are
+   *  free; this applies to flatten orders that cross the book. */
+  takerFeeMax: number;
 }
 
 export interface RiskConfig {
@@ -58,6 +64,8 @@ export function parseBotYaml(raw: string): BotConfig {
     },
     flattenBeforeSec: m.flatten_before_sec ?? 20,
     flattenIfNetAboveUsd: m.flatten_if_net_above_usd ?? 6.0,
+    fillParticipation: m.fill_participation ?? 1.0,
+    takerFeeMax: m.taker_fee_max ?? 0.018,
   };
 
   const r = obj.risk ?? {};

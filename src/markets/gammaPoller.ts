@@ -13,6 +13,13 @@ export interface ShortMarket {
   yesTokenId: string;
   noTokenId: string;
   resolvesAt: Date;
+  /** Liquidity-rewards config (from Gamma). Orders within `rewardsMaxSpread`
+   *  cents of the mid and of at least `rewardsMinSize` shares earn daily USDC
+   *  rewards. Null when the field is absent. */
+  rewardsMaxSpread: number | null;
+  rewardsMinSize: number | null;
+  /** Gamma's reported book spread at discovery time (reference snapshot). */
+  gammaSpread: number | null;
 }
 
 /** Window length in minutes parsed from the "h:mmam-h:mmpm" range in the question. */
@@ -41,6 +48,15 @@ interface GammaMarketRaw {
   endDate?: string;
   clobTokenIds?: string[] | string;
   acceptingOrders?: boolean;
+  rewardsMaxSpread?: number | string;
+  rewardsMinSize?: number | string;
+  spread?: number | string;
+}
+
+function numOrNull(v: any): number | null {
+  if (v === undefined || v === null || v === '') return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
 }
 
 function parseTokenIds(raw: any): string[] {
@@ -93,6 +109,9 @@ export async function fetchMarkets(assets: Asset[], windowMin: number): Promise<
         yesTokenId: tokens[0],
         noTokenId: tokens[1],
         resolvesAt,
+        rewardsMaxSpread: numOrNull(m.rewardsMaxSpread),
+        rewardsMinSize: numOrNull(m.rewardsMinSize),
+        gammaSpread: numOrNull(m.spread),
       });
     }
 
