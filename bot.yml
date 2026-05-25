@@ -1,0 +1,24 @@
+# 5m-maker configuration. Conservative defaults for the validation phase.
+# Tune `maker.half_spread` and the adverse_guard thresholds from real tapes
+# via `npm run simulate` before trusting these for a live bot.
+
+assets: [BTC, ETH, SOL, XRP, BNB, DOGE]
+
+maker:
+  half_spread: 0.03            # distance from mid per side (in price units)
+  quote_size_usd: 3.0          # notional per quoted side
+  inventory_skew_k: 0.5        # strength of inventory auto-correction (0 = none)
+  widen_factor: 2.0            # spread multiplier when BTC is moving (informed-flow regime)
+  max_inventory_usd: 15.0      # beyond this (signed), drop the side that would add inventory
+  tick_size: 0.01              # price granularity for rounding quotes
+
+  adverse_guard:
+    btc_return_30s_widen: 0.0005   # |R30| above this => widen spread
+    btc_return_30s_pull: 0.0010    # |R30| above this => pull the vulnerable side entirely
+
+  flatten_before_sec: 20       # stop quoting this many seconds before resolution
+  flatten_if_net_above_usd: 6.0  # in the flatten window, cross to flatten if |inventory| exceeds this
+
+risk:
+  daily_loss_limit_usd: 10.0   # used by the future live bot only
+  max_committed_usd: 12.0      # max capital resting in live orders (live bot only)
