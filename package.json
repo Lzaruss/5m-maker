@@ -11,7 +11,8 @@
     "test": "vitest",
     "test:run": "vitest run",
     "record": "npm run tsnode -- scripts/recorder.ts",
-    "simulate": "npm run tsnode -- scripts/simulate.ts"
+    "simulate": "npm run tsnode -- scripts/simulate.ts",
+    "analyze": "npm run tsnode -- scripts/analyze.ts"
   },
   "dependencies": {
     "axios": "^1.6.0",
