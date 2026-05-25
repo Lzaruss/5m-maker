@@ -15,11 +15,19 @@ export interface ShortMarket {
   resolvesAt: Date;
   /** Liquidity-rewards config (from Gamma). Orders within `rewardsMaxSpread`
    *  cents of the mid and of at least `rewardsMinSize` shares earn daily USDC
-   *  rewards. Null when the field is absent. */
+   *  rewards — but ONLY if a non-null reward rate is actually configured (see
+   *  `rewardsRates`, fetched from the CLOB). Null when the field is absent. */
   rewardsMaxSpread: number | null;
   rewardsMinSize: number | null;
   /** Gamma's reported book spread at discovery time (reference snapshot). */
   gammaSpread: number | null;
+  /** Fee schedule (from Gamma `feeSchedule`). Taker fee in USDC =
+   *  `shares * feeRate * (p*(1-p))^feeExponent`. Makers pay 0 when takerOnly. */
+  feeRate: number | null;
+  feeExponent: number | null;
+  feeTakerOnly: boolean | null;
+  /** Fraction of taker fees rebated to makers (e.g. 0.2 = 20% on crypto). */
+  rebateRate: number | null;
 }
 
 /** Window length in minutes parsed from the "h:mmam-h:mmpm" range in the question. */
@@ -51,6 +59,7 @@ interface GammaMarketRaw {
   rewardsMaxSpread?: number | string;
   rewardsMinSize?: number | string;
   spread?: number | string;
+  feeSchedule?: { rate?: number; exponent?: number; takerOnly?: boolean; rebateRate?: number };
 }
 
 function numOrNull(v: any): number | null {
@@ -112,6 +121,10 @@ export async function fetchMarkets(assets: Asset[], windowMin: number): Promise<
         rewardsMaxSpread: numOrNull(m.rewardsMaxSpread),
         rewardsMinSize: numOrNull(m.rewardsMinSize),
         gammaSpread: numOrNull(m.spread),
+        feeRate: numOrNull(m.feeSchedule?.rate),
+        feeExponent: numOrNull(m.feeSchedule?.exponent),
+        feeTakerOnly: typeof m.feeSchedule?.takerOnly === 'boolean' ? m.feeSchedule.takerOnly : null,
+        rebateRate: numOrNull(m.feeSchedule?.rebateRate),
       });
     }
 
@@ -121,6 +134,40 @@ export async function fetchMarkets(assets: Asset[], windowMin: number): Promise<
   } catch (err: any) {
     logger.error({ error: err.message }, 'Failed to fetch Gamma markets');
     return [];
+  }
+}
+
+const CLOB = 'https://clob.polymarket.com';
+
+export interface ClobRewards {
+  /** Reward emission rates. null/empty => the market pays NO liquidity rewards
+   *  (the case for 5m crypto markets as of 2026-05). Non-empty => active pool. */
+  rates: unknown[] | null;
+  minSize: number | null;
+  maxSpread: number | null;
+}
+
+/**
+ * Authoritative liquidity-rewards config from the CLOB market object. Gamma
+ * exposes `rewardsMinSize`/`rewardsMaxSpread` but NOT whether a reward rate is
+ * actually funded — only the CLOB `rewards.rates` field tells us that. We record
+ * it so a future reward model has ground truth (and so we notice if/when these
+ * markets start paying rewards). Returns null on error.
+ */
+export async function fetchClobRewards(conditionId: string): Promise<ClobRewards | null> {
+  if (!conditionId) return null;
+  try {
+    const resp = await axios.get<any>(`${CLOB}/markets/${conditionId}`, { timeout: 15000 });
+    const r = resp.data?.rewards;
+    if (!r) return { rates: null, minSize: null, maxSpread: null };
+    return {
+      rates: Array.isArray(r.rates) ? r.rates : null,
+      minSize: numOrNull(r.min_size),
+      maxSpread: numOrNull(r.max_spread),
+    };
+  } catch (err: any) {
+    logger.debug({ error: err.message, conditionId }, 'fetchClobRewards failed');
+    return null;
   }
 }
 

@@ -132,11 +132,11 @@ function ingestTape(path: string, byToken: Map<string, Window>): void {
   }
 }
 
-/** Approximate Polymarket dynamic taker-fee factor: max at price 0.50, ~0 at
- *  the extremes. fee = takerFeeMax * 2*min(p,1-p) * notional. */
-function takerFee(price: number, shares: number, maxRate: number): number {
-  const factor = 2 * Math.min(price, 1 - price);
-  return maxRate * factor * price * shares;
+/** Real Polymarket taker fee (USDC), confirmed from `feeSchedule` and docs:
+ *  fee = shares * feeRate * p*(1-p). Symmetric around p=0.5 (max), ~0 at the
+ *  extremes. At feeRate=0.07 this is ~1.8% per share at p=0.50. */
+function takerFee(price: number, shares: number, feeRate: number): number {
+  return shares * feeRate * price * (1 - price);
 }
 
 function simulate(windows: Window[], cfg: MakerConfig): SimMetrics {
@@ -210,13 +210,13 @@ function simulate(windows: Window[], cfg: MakerConfig): SimMetrics {
           const qty = Math.abs(inv.shares);
           if (inv.shares > 0) {
             inv = applyFill(inv, { side: 'SELL', price: lastBid, shares: qty });
-            const fee = takerFee(lastBid, qty, cfg.takerFeeMax);
+            const fee = takerFee(lastBid, qty, cfg.takerFeeRate);
             inv = { ...inv, cashUsd: inv.cashUsd - fee };
             m.takerFeesPaid += fee;
             m.sellShares += qty;
           } else if (inv.shares < 0) {
             inv = applyFill(inv, { side: 'BUY', price: lastAsk, shares: qty });
-            const fee = takerFee(lastAsk, qty, cfg.takerFeeMax);
+            const fee = takerFee(lastAsk, qty, cfg.takerFeeRate);
             inv = { ...inv, cashUsd: inv.cashUsd - fee };
             m.takerFeesPaid += fee;
             m.buyShares += qty;
@@ -391,7 +391,7 @@ function main(): void {
   console.log(`Loaded ${windows.length} market windows from ${paths.length} tape(s):`);
   for (const p of paths) console.log(`  - ${p}`);
   console.log(
-    `Realism knobs: fill_participation=${cfg.maker.fillParticipation}, taker_fee_max=${cfg.maker.takerFeeMax}`,
+    `Realism knobs: fill_participation=${cfg.maker.fillParticipation}, taker_fee_rate=${cfg.maker.takerFeeRate}`,
   );
   if (windows.length === 0) {
     console.log('No complete windows with metadata to simulate. Record more tape.');

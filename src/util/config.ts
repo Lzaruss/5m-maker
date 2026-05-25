@@ -24,9 +24,11 @@ export interface MakerConfig {
   /** Simulator only: fraction of a crossing trade's size we assume to capture
    *  (queue-position proxy). 1.0 = front-of-line on the whole print. */
   fillParticipation: number;
-  /** Simulator only: max crypto taker fee rate (at price 0.50). Maker fills are
-   *  free; this applies to flatten orders that cross the book. */
-  takerFeeMax: number;
+  /** Simulator only: crypto taker fee rate. Real Polymarket formula (confirmed
+   *  from `feeSchedule`): taker fee USDC = shares * feeRate * p*(1-p). At
+   *  feeRate=0.07 this is ~1.8% per share at p=0.50. Makers pay 0; this applies
+   *  to flatten orders that cross the book. */
+  takerFeeRate: number;
 }
 
 export interface RiskConfig {
@@ -65,7 +67,9 @@ export function parseBotYaml(raw: string): BotConfig {
     flattenBeforeSec: m.flatten_before_sec ?? 20,
     flattenIfNetAboveUsd: m.flatten_if_net_above_usd ?? 6.0,
     fillParticipation: m.fill_participation ?? 1.0,
-    takerFeeMax: m.taker_fee_max ?? 0.018,
+    // Accept new key `taker_fee_rate` (0.07) or fall back to the legacy
+    // `taker_fee_max` if an old bot.yml is still in use.
+    takerFeeRate: m.taker_fee_rate ?? m.taker_fee_max ?? 0.07,
   };
 
   const r = obj.risk ?? {};

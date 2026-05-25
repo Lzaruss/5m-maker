@@ -21,7 +21,7 @@ maker:
 
   # ── Simulator realism knobs (ignored by the live bot) ────────────────────
   fill_participation: 1.0      # fraction of a crossing trade we capture (queue proxy); lower = more conservative
-  taker_fee_max: 0.018         # crypto taker fee at price 0.50 (makers pay 0; this hits flatten orders)
+  taker_fee_rate: 0.07         # crypto fee rate; taker fee USDC = shares*rate*p*(1-p) (~1.8% at p=0.5). Makers pay 0; hits flatten orders.
 
 risk:
   daily_loss_limit_usd: 10.0   # used by the future live bot only

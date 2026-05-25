@@ -19,7 +19,12 @@ import { resolve } from 'node:path';
 import { loadBotYaml } from '../src/util/config.js';
 import { logger } from '../src/util/logger.js';
 import { PriceFeed } from '../src/signals/priceFeed.js';
-import { fetchMarkets, fetchResolution, type ShortMarket } from '../src/markets/gammaPoller.js';
+import {
+  fetchMarkets,
+  fetchResolution,
+  fetchClobRewards,
+  type ShortMarket,
+} from '../src/markets/gammaPoller.js';
 import { ClobMarketFeed } from '../src/marketFeed/clobMarketFeed.js';
 import type { Asset } from '../src/util/assets.js';
 
@@ -169,22 +174,33 @@ async function main(): Promise<void> {
         }
       }
 
-      // Announce metadata for newly tracked markets.
+      // Announce metadata for newly tracked markets. One CLOB call per new
+      // market fetches the authoritative reward rate (rates=null => no rewards).
       for (const tm of tracked.values()) {
         if (tm.announced) continue;
         tm.announced = true;
+        const clobRewards = await fetchClobRewards(tm.market.conditionId);
         write({
           t: 'market',
           ts: Date.now(),
           tokenId: tm.market.yesTokenId,
+          conditionId: tm.market.conditionId,
           asset: tm.market.asset,
           resolvesAt: tm.market.resolvesAt.getTime(),
           windowMinutes: tm.market.windowMinutes,
           question: tm.market.question,
-          // Liquidity-rewards config — needed to study the reward edge later.
+          // Liquidity-rewards config. `rewardsRates` is the ground truth: null
+          // => the market pays NO liquidity rewards (current 5m crypto case).
           rewardsMaxSpread: tm.market.rewardsMaxSpread,
           rewardsMinSize: tm.market.rewardsMinSize,
+          rewardsRates: clobRewards ? clobRewards.rates : undefined,
+          rewardsActive: clobRewards ? (clobRewards.rates?.length ?? 0) > 0 : null,
           gammaSpread: tm.market.gammaSpread,
+          // Fee schedule + maker rebate — the real maker economics here.
+          feeRate: tm.market.feeRate,
+          feeExponent: tm.market.feeExponent,
+          feeTakerOnly: tm.market.feeTakerOnly,
+          rebateRate: tm.market.rebateRate,
         });
       }
 

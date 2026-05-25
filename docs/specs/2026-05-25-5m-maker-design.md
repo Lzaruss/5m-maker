@@ -169,3 +169,15 @@ External research (Polymarket docs, the official `Polymarket/poly-market-maker` 
 - **5m is the hard case:** the official keeper syncs every 30s (built for long-lived markets); community notes that 5m favors aggressive taker entries due to adverse selection.
 
 **Implication for the study phase:** the current simulator measures spread P&L (marginal here) and ignores rewards (likely the real edge). Interpret current backtest numbers as a spread-only lower bound. Candidate next analyses (not yet built): model reward accrual from recorded depth + reward params; reassess order sizing and inventory limits.
+
+### 11.1 Correction after authoritative API check (2026-05-26)
+
+Fetching the **CLOB** market object (not just Gamma) corrected the rewards picture and pinned down the fee math:
+
+- **Liquidity rewards: `rewards.rates = null` for these 5m crypto markets** → they currently pay **no** liquidity-reward pool. The `rewardsMinSize=50` / `rewardsMaxSpread=4.5` in Gamma are just config bounds with no funded rate. So rewards are **not** the edge here, contrary to the 11. hypothesis. (The recorder now records `rewardsRates`/`rewardsActive` so we'd notice if this ever turns on.)
+- **Real maker economics = the fee/rebate schedule** (`feeSchedule`, confirmed against docs):
+  - Taker fee (USDC) = `shares × feeRate × p×(1−p)`, crypto `feeRate=0.07`, exponent 1 ⇒ ~1.8% per share at p=0.50, ~0 at the extremes. **Makers pay 0** (`takerOnly:true`).
+  - **Maker rebate: 20% of taker fees** (`rebateRate=0.2`) redistributed to makers daily — a real maker income tied to filled volume, **not yet modeled** in the simulator.
+- **Simulator fee fix:** the flatten taker-fee now uses the exact `shares*feeRate*p*(1-p)` formula (was a cruder approximation). Config key `taker_fee_rate: 0.07`.
+
+**Recorder now captures** per market: `feeRate`, `feeExponent`, `feeTakerOnly`, `rebateRate`, and `rewardsRates`/`rewardsActive` — closing the economic-data gap so the long run has ground truth. Modeling the maker rebate as income is a candidate next analysis (deferred until we study the long-run data).

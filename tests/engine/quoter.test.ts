@@ -13,7 +13,7 @@ const cfg: MakerConfig = {
   flattenBeforeSec: 20,
   flattenIfNetAboveUsd: 6.0,
   fillParticipation: 1.0,
-  takerFeeMax: 0.018,
+  takerFeeRate: 0.07,
 };
 
 const base: QuoteInput = {

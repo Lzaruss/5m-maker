@@ -79,6 +79,7 @@ async function main(): Promise<void> {
   const byAsset = new Map<string, Agg>();
   const byBucket: Agg[] = BUCKETS.map(emptyAgg);
   const spreadHist = new Map<number, number>(); // cents -> count
+  const assetSpreadHist = new Map<string, Map<number, number>>(); // asset -> cents -> count
   const tradeSizeHist = new Map<string, number>(); // bucket -> count
   const perWindowTrades = new Map<string, number>();
   const assetWindows = new Map<string, Set<string>>();
@@ -159,6 +160,12 @@ async function main(): Promise<void> {
           byBucket[bi].spreadCentSum += spreadCent;
         }
         spreadHist.set(Math.round(spreadCent), (spreadHist.get(Math.round(spreadCent)) ?? 0) + 1);
+        let ash = assetSpreadHist.get(m.asset);
+        if (!ash) {
+          ash = new Map();
+          assetSpreadHist.set(m.asset, ash);
+        }
+        ash.set(Math.round(spreadCent), (ash.get(Math.round(spreadCent)) ?? 0) + 1);
 
         // Competing liquidity within the reward band (needs depth + reward param).
         if (Array.isArray(e.bids) && Array.isArray(e.asks) && m.rewardsMaxSpread) {
@@ -219,18 +226,24 @@ async function main(): Promise<void> {
   if (tradesWithMinKnown)
     console.log(`trades >= reward minSize: ${tradesGteMin}/${tradesWithMinKnown} (${pct(tradesGteMin, tradesWithMinKnown)})`);
 
-  console.log(`\n-- Real spread & reward-band depth by asset --`);
-  console.log(`  ${'asset'.padEnd(6)}${'medSpread?'.padStart(0)}` +
-    `${'avgSpread(c)'.padStart(12)}${'bandBid(sh)'.padStart(12)}${'bandAsk(sh)'.padStart(12)}${'trades'.padStart(8)}${'vol(sh)'.padStart(10)}`);
+  console.log(`\n-- Real spread (cents) & reward-band depth by asset --`);
+  console.log(
+    `  ${'asset'.padEnd(6)}${'medSpread'.padStart(10)}${'p90Spread'.padStart(10)}${'avgSpread'.padStart(10)}` +
+      `${'bandBid(sh)'.padStart(12)}${'bandAsk(sh)'.padStart(12)}${'trades'.padStart(8)}${'vol(sh)'.padStart(10)}`,
+  );
   for (const [asset, a] of [...byAsset.entries()].sort()) {
     const avgSpread = a.bookSamples ? a.spreadCentSum / a.bookSamples : 0;
     const bb = a.bandSamples ? a.bandBidSum / a.bandSamples : 0;
     const ba = a.bandSamples ? a.bandAskSum / a.bandSamples : 0;
+    const ash = assetSpreadHist.get(asset);
+    const med = ash ? percentile(ash, 0.5) : 0;
+    const p90 = ash ? percentile(ash, 0.9) : 0;
     console.log(
-      `  ${asset.padEnd(6)}${avgSpread.toFixed(2).padStart(12)}${bb.toFixed(0).padStart(12)}${ba.toFixed(0).padStart(12)}` +
-        `${String(a.trades).padStart(8)}${a.tradeShares.toFixed(0).padStart(10)}`,
+      `  ${asset.padEnd(6)}${med.toFixed(0).padStart(10)}${p90.toFixed(0).padStart(10)}${avgSpread.toFixed(2).padStart(10)}` +
+        `${bb.toFixed(0).padStart(12)}${ba.toFixed(0).padStart(12)}${String(a.trades).padStart(8)}${a.tradeShares.toFixed(0).padStart(10)}`,
     );
   }
+  console.log(`  (avg is skewed high by extreme one-sided books near resolution; median is the typical spread)`);
 
   console.log(`\n-- Reward-share estimate with a 50-share quote (50/(50+avg competing band depth)) --`);
   for (const [asset, a] of [...byAsset.entries()].sort()) {
@@ -277,6 +290,19 @@ async function main(): Promise<void> {
   }
 
   console.log(`\n================================================\n`);
+}
+
+/** Percentile from an integer-keyed count histogram. */
+function percentile(hist: Map<number, number>, q: number): number {
+  const total = [...hist.values()].reduce((s, x) => s + x, 0);
+  if (total === 0) return 0;
+  const target = q * total;
+  let cum = 0;
+  for (const k of [...hist.keys()].sort((a, b) => a - b)) {
+    cum += hist.get(k)!;
+    if (cum >= target) return k;
+  }
+  return 0;
 }
 
 function fmtTs(ms: number): string {
