@@ -78,6 +78,10 @@ crypto/5m-maker/
 
 `wss://ws-subscriptions-clob.polymarket.com/ws/market`. Subscribe with `{ type: "market", assets_ids: [...tokenIds] }`. Emits per-asset events: `book` (full bids/asks), `price_change` (deltas), `last_trade_price` (executed price/size/side). The recorder persists `book` and `last_trade_price` events; `last_trade_price` is the trade tape the simulator needs.
 
+**Trade-tape note:** the venue's public market channel is the only market-wide trade source (the data-api `/trades` endpoint is per-wallet). If `last_trade_price` coalesces same-price prints, the tape can *undercount* fills — a conservative bias (fewer simulated fills than reality), acceptable for a go/no-go decision.
+
+**Resolution capture:** after a window's resolve time, the recorder reads the outcome via Gamma `?clob_token_ids=<yesToken>` — `outcomePrices` converge to ~0/1 even while the market still reports `closed:false` (e.g. `["0.005","0.995"]` = Down won). It writes a `resolution` event (`yesWon`) so the simulator can settle leftover inventory at the real 0/1 rather than approximating. This cannot be reconstructed after the fact, so it must be recorded live.
+
 ## 6. Pure engine contracts
 
 ```typescript
@@ -110,7 +114,9 @@ Replay events in timestamp order. On each `book` update, recompute desired quote
 - if our live **ask** exists and `p >= askPrice` → we sell `min(s, askShares)` at `askPrice`;
 - trades strictly inside our spread → no fill.
 
-We never fill more than the real traded volume, so simulated activity cannot exceed what actually happened. At `flatten_before_sec` the close logic flattens large inventory at the touch (best bid/ask). Residual inventory after flatten is marked at the last observed mid (small by construction; documented approximation rather than a BTC-derived 0/1 settlement in v1).
+We never fill more than the real traded volume, so simulated activity cannot exceed what actually happened. At `flatten_before_sec` the close logic flattens large inventory at the touch (best bid/ask). Residual inventory is settled at the **real 0/1 outcome** when the recorder captured a `resolution` event; otherwise it falls back to the last observed mid. At equal timestamps, trades are processed before book updates so a fill is matched against the quote that was actually resting (no look-ahead).
+
+**Phantom-liquidity caveat:** our simulated resting orders do not alter the recorded book or consume real depth ahead of us (queue position is assumed front-of-line). This is the standard optimistic bias of replay-based MM backtests; the conservative `last_trade_price` fill cap partially offsets it. Treat simulated P&L as an upper-ish bound and require a clear margin before going live.
 
 **Reported metrics:** total P&L, completed rounds, fills, mean/max |inventory|, times pulled by adverse guard, times left holding at flatten, P&L per window, and a sweep of P&L vs `half_spread`.
 
@@ -142,5 +148,6 @@ Engine functions are pure and tested exhaustively (quote placement, skew directi
 ## 10. Open questions
 
 - Exact `half_spread` / guard thresholds: to be calibrated from the first recorded tapes via `simulate.ts`.
-- Residual-inventory settlement (mark-to-mid vs BTC-derived 0/1): mark-to-mid in v1; revisit if residual variance proves material.
 - Tick size per market: assumed 0.01; recorder will confirm from `tick_size_change` events.
+
+**Resolved during review (2026-05-25):** residual-inventory settlement now uses the real 0/1 outcome captured by the recorder (`resolution` events), with mark-to-mid only as a fallback when an outcome was not recorded.

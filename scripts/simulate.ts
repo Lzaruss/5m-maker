@@ -112,6 +112,11 @@ function loadWindows(path: string): Window[] {
       }
       continue;
     }
+    if (ev.t === 'resolution') {
+      const w = byToken.get(ev.tokenId);
+      if (w && typeof ev.yesWon === 'boolean') w.yesWon = ev.yesWon;
+      continue;
+    }
     const w = byToken.get(ev.tokenId);
     if (!w) continue; // no metadata yet -> can't compute time-to-resolve
     w.events.push(ev);
@@ -133,6 +138,7 @@ function simulate(windows: Window[], cfg: MakerConfig): SimMetrics {
     widenedQuotes: 0,
     flattens: 0,
     heldResiduals: 0,
+    outcomeSettled: 0,
     pnls: [],
   };
 
@@ -152,7 +158,11 @@ function simulate(windows: Window[], cfg: MakerConfig): SimMetrics {
     let askRemaining = 0;
     let flattened = false;
 
-    const events = w.events.sort((a, b) => a.ts - b.ts);
+    // Chronological order; at equal timestamps process trades BEFORE books so a
+    // trade fills against the quote that was actually resting (set from the
+    // prior book), not against a quote derived from a same-instant book update.
+    const typeRank = (t: string) => (t === 'trade' ? 0 : 1);
+    const events = w.events.sort((a, b) => a.ts - b.ts || typeRank(a.t) - typeRank(b.t));
 
     for (const ev of events) {
       const timeToResolveSec = (w.resolvesAt - ev.ts) / 1000;
@@ -241,9 +251,16 @@ function simulate(windows: Window[], cfg: MakerConfig): SimMetrics {
 
     if (lastMid <= 0) continue; // window had no usable book; skip
 
-    // Settle residual inventory at last observed mid (documented approximation).
+    // Settle residual inventory. Prefer the real 0/1 outcome when the recorder
+    // captured it (this is the true adverse-selection cost); otherwise fall back
+    // to marking at the last observed mid.
     if (Math.abs(inv.shares) > 1e-6) m.heldResiduals++;
-    const windowPnl = inv.cashUsd + inv.shares * lastMid;
+    let settlePrice = lastMid;
+    if (typeof w.yesWon === 'boolean') {
+      settlePrice = w.yesWon ? 1 : 0;
+      m.outcomeSettled++;
+    }
+    const windowPnl = inv.cashUsd + inv.shares * settlePrice;
     m.totalPnl += windowPnl;
     m.pnls.push(windowPnl);
     m.windows++;
@@ -274,6 +291,7 @@ function report(label: string, m: SimMetrics): void {
   console.log(`quotes one-side pull: ${m.pulledQuotes}`);
   console.log(`flattens at close   : ${m.flattens}`);
   console.log(`held residuals      : ${m.heldResiduals}`);
+  console.log(`settled at real 0/1 : ${m.outcomeSettled}/${m.windows} (rest marked at mid)`);
 }
 
 function fmtUsd(x: number): string {
