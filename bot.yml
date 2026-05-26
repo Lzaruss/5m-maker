@@ -26,3 +26,10 @@ maker:
 risk:
   daily_loss_limit_usd: 10.0   # used by the future live bot only
   max_committed_usd: 12.0      # max capital resting in live orders (live bot only)
+
+live:
+  enabled: false          # set true ONLY when you intend to trade real money
+  assets: [BTC]
+  max_deployed_usd: 50
+  daily_loss_halt_usd: 20
+  poll_interval_ms: 1500

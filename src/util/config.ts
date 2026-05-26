@@ -36,10 +36,19 @@ export interface RiskConfig {
   maxCommittedUsd: number;
 }
 
+export interface LiveConfig {
+  enabled: boolean;
+  assets: Asset[];
+  maxDeployedUsd: number;
+  dailyLossHaltUsd: number;
+  pollIntervalMs: number;
+}
+
 export interface BotConfig {
   assets: Asset[];
   maker: MakerConfig;
   risk: RiskConfig;
+  live: LiveConfig;
 }
 
 export function parseBotYaml(raw: string): BotConfig {
@@ -78,7 +87,21 @@ export function parseBotYaml(raw: string): BotConfig {
     maxCommittedUsd: r.max_committed_usd ?? 12.0,
   };
 
-  return { assets, maker, risk };
+  const lv = obj.live ?? {};
+  const liveAssets: Asset[] = (Array.isArray(lv.assets) && lv.assets.length ? lv.assets : ['BTC'])
+    .map((a: any) => {
+      const up = String(a).toUpperCase();
+      if (!isAsset(up)) throw new Error(`Unknown live asset: ${a}`);
+      return up;
+    });
+  const live: LiveConfig = {
+    enabled: lv.enabled === true,
+    assets: liveAssets,
+    maxDeployedUsd: lv.max_deployed_usd ?? 50,
+    dailyLossHaltUsd: lv.daily_loss_halt_usd ?? 20,
+    pollIntervalMs: lv.poll_interval_ms ?? 1500,
+  };
+  return { assets, maker, risk, live };
 }
 
 export function loadBotYaml(path = 'bot.yml'): BotConfig {
