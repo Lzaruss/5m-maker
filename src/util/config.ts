@@ -107,3 +107,45 @@ export function parseBotYaml(raw: string): BotConfig {
 export function loadBotYaml(path = 'bot.yml'): BotConfig {
   return parseBotYaml(readFileSync(resolve(path), 'utf8'));
 }
+
+// ---------------------------------------------------------------------------
+// Environment / CLOB credentials (same wallet as btc-5m-sniper)
+// ---------------------------------------------------------------------------
+
+export interface EnvConfig {
+  clobHost: string;
+  clobChainId: number;
+  clobPrivateKey: string;
+  clobFunderAddress: string;
+  clobApiKey: string;
+  clobApiSecret: string;
+  clobApiPassphrase: string;
+  clobSignatureType: number;
+  telegramBotToken: string;
+  telegramChatId: string;
+  logLevel: string;
+  dryRun: boolean;
+}
+
+function required(key: string): string {
+  const v = process.env[key];
+  if (!v) throw new Error(`Missing required env var: ${key}`);
+  return v;
+}
+
+export function loadEnv(): EnvConfig {
+  return {
+    clobHost: required('CLOB_HOST'),
+    clobChainId: parseInt(required('CLOB_CHAIN_ID'), 10),
+    clobPrivateKey: required('CLOB_PRIVATE_KEY'),
+    clobFunderAddress: required('CLOB_FUNDER_ADDRESS'),
+    clobApiKey: required('CLOB_API_KEY'),
+    clobApiSecret: required('CLOB_API_SECRET'),
+    clobApiPassphrase: required('CLOB_API_PASSPHRASE'),
+    clobSignatureType: parseInt(process.env.CLOB_SIGNATURE_TYPE ?? '3', 10),
+    telegramBotToken: process.env.TELEGRAM_BOT_TOKEN ?? '',
+    telegramChatId: process.env.TELEGRAM_CHAT_ID ?? '',
+    logLevel: process.env.LOG_LEVEL ?? 'info',
+    dryRun: (process.env.DRY_RUN ?? 'false').toLowerCase() === 'true',
+  };
+}
