@@ -41,6 +41,8 @@ interface TapeEvent {
   // book
   bid?: number | null;
   ask?: number | null;
+  bidSz?: number | null; // top-of-book size (queue-ahead proxy)
+  askSz?: number | null;
   // trade
   price?: number;
   size?: number;
@@ -57,12 +59,20 @@ interface Window {
   resolvesAt: number;
   /** Actual resolution if captured: true = Up/YES won. undefined = unknown. */
   yesWon?: boolean;
+  /** Per-market economics from the market line. */
+  feeRate: number;
+  rebateRate: number;
+  /** Realized BTC volatility proxy (mean |btcR30| over the window). */
+  vol: number;
+  volBucket: 'low' | 'mid' | 'high';
   events: TapeEvent[];
 }
 
 interface SimMetrics {
   windows: number;
   totalPnl: number;
+  grossSpreadPnl: number; // P&L before rebate (spread/settlement only)
+  rebatesEarned: number; // modeled maker-rebate income
   fills: number;
   buyShares: number;
   sellShares: number;
@@ -76,8 +86,15 @@ interface SimMetrics {
   takerFeesPaid: number; // total taker fees paid on flatten orders
   byAsset: Map<string, { pnl: number; windows: number }>;
   byHour: Map<number, { pnl: number; windows: number }>;
+  byVol: Map<string, { pnl: number; windows: number }>;
+  /** Peak / mean total capital deployed across concurrently-active windows. */
+  peakConcurrentUsd: number;
+  meanConcurrentUsd: number;
   pnls: number[]; // per-window
 }
+
+const DEFAULT_FEE_RATE = 0.07;
+const DEFAULT_REBATE_RATE = 0.2;
 
 function allTapes(): string[] {
   const dir = resolve('data');
@@ -107,17 +124,24 @@ function ingestTape(path: string, byToken: Map<string, Window>): void {
       continue;
     }
     if (ev.t === 'market') {
+      const e = ev as any;
       if (!byToken.has(ev.tokenId)) {
         byToken.set(ev.tokenId, {
           tokenId: ev.tokenId,
           asset: ev.asset ?? '?',
           resolvesAt: ev.resolvesAt ?? 0,
+          feeRate: typeof e.feeRate === 'number' ? e.feeRate : DEFAULT_FEE_RATE,
+          rebateRate: typeof e.rebateRate === 'number' ? e.rebateRate : DEFAULT_REBATE_RATE,
+          vol: 0,
+          volBucket: 'low',
           events: [],
         });
       } else {
         const w = byToken.get(ev.tokenId)!;
         w.resolvesAt = ev.resolvesAt ?? w.resolvesAt;
         w.asset = ev.asset ?? w.asset;
+        if (typeof e.feeRate === 'number') w.feeRate = e.feeRate;
+        if (typeof e.rebateRate === 'number') w.rebateRate = e.rebateRate;
       }
       continue;
     }
@@ -128,8 +152,38 @@ function ingestTape(path: string, byToken: Map<string, Window>): void {
     }
     const w = byToken.get(ev.tokenId);
     if (!w) continue; // no metadata yet -> can't compute time-to-resolve
-    w.events.push(ev);
+    // Keep only the fields the simulator uses — drops the heavy depth arrays so
+    // large multi-hundred-MB tapes fit in memory. Top-of-book sizes are kept for
+    // the queue model.
+    if (ev.t === 'book') {
+      w.events.push({ t: 'book', ts: ev.ts, tokenId: ev.tokenId, bid: ev.bid, ask: ev.ask, bidSz: ev.bidSz, askSz: ev.askSz, btcR30: ev.btcR30 });
+    } else if (ev.t === 'trade') {
+      w.events.push({ t: 'trade', ts: ev.ts, tokenId: ev.tokenId, price: ev.price, size: ev.size, side: ev.side });
+    }
   }
+}
+
+/** Per-window realized volatility proxy = mean |btcR30| over its book events. */
+function computeVol(w: Window): number {
+  let sum = 0;
+  let n = 0;
+  for (const ev of w.events) {
+    if (ev.t === 'book' && typeof ev.btcR30 === 'number') {
+      sum += Math.abs(ev.btcR30);
+      n++;
+    }
+  }
+  return n > 0 ? sum / n : 0;
+}
+
+/** Tag every window with a low/mid/high volatility bucket by global terciles. */
+function assignVolBuckets(windows: Window[]): void {
+  for (const w of windows) w.vol = computeVol(w);
+  const vols = windows.map((w) => w.vol).sort((a, b) => a - b);
+  if (vols.length === 0) return;
+  const t1 = vols[Math.floor(vols.length / 3)];
+  const t2 = vols[Math.floor((2 * vols.length) / 3)];
+  for (const w of windows) w.volBucket = w.vol <= t1 ? 'low' : w.vol <= t2 ? 'mid' : 'high';
 }
 
 /** Real Polymarket taker fee (USDC), confirmed from `feeSchedule` and docs:
@@ -143,6 +197,8 @@ function simulate(windows: Window[], cfg: MakerConfig): SimMetrics {
   const m: SimMetrics = {
     windows: 0,
     totalPnl: 0,
+    grossSpreadPnl: 0,
+    rebatesEarned: 0,
     fills: 0,
     buyShares: 0,
     sellShares: 0,
@@ -156,12 +212,19 @@ function simulate(windows: Window[], cfg: MakerConfig): SimMetrics {
     takerFeesPaid: 0,
     byAsset: new Map(),
     byHour: new Map(),
+    byVol: new Map(),
+    peakConcurrentUsd: 0,
+    meanConcurrentUsd: 0,
     pnls: [],
   };
 
   let invSampleSum = 0;
   let invSamples = 0;
   const maxShares = (price: number) => cfg.maxInventoryUsd / price;
+  // Global 5s buckets of summed working capital across concurrently-active
+  // windows (Step 5: balance sizing).
+  const CAP_BUCKET_MS = 5000;
+  const concurrentCap = new Map<number, number>();
 
   for (const w of windows) {
     let inv: InventoryState = emptyInventory();
@@ -176,6 +239,13 @@ function simulate(windows: Window[], cfg: MakerConfig): SimMetrics {
     let askPrice: number | null = null;
     let askRemaining = 0;
     let flattened = false;
+    // Top-of-book best price + size (queue-ahead proxy for the fill model).
+    let bestBid = 0;
+    let bestAsk = 0;
+    let bestBidSz = 0;
+    let bestAskSz = 0;
+    // Per-window peak working capital within each 5s bucket.
+    const windowBucketPeak = new Map<number, number>();
 
     // Chronological order; at equal timestamps process trades BEFORE books so a
     // trade fills against the quote that was actually resting (set from the
@@ -194,6 +264,10 @@ function simulate(windows: Window[], cfg: MakerConfig): SimMetrics {
           lastBid = bb;
           lastAsk = ba;
           lastMid = (bb + ba) / 2;
+          bestBid = bb;
+          bestAsk = ba;
+          bestBidSz = ev.bidSz ?? 0;
+          bestAskSz = ev.askSz ?? 0;
         }
         if (lastMid <= 0) continue;
 
@@ -202,6 +276,12 @@ function simulate(windows: Window[], cfg: MakerConfig): SimMetrics {
         invSampleSum += Math.abs(invUsd);
         invSamples++;
         m.maxAbsInvUsd = Math.max(m.maxAbsInvUsd, Math.abs(invUsd));
+
+        // Sample working capital (USDC in resting buy orders + value of held
+        // shares) into this window's per-bucket peak.
+        const capital = (bidPrice ? bidRemaining * bidPrice : 0) + Math.abs(inv.shares) * lastMid;
+        const bkt = Math.floor(ev.ts / CAP_BUCKET_MS);
+        if (capital > (windowBucketPeak.get(bkt) ?? 0)) windowBucketPeak.set(bkt, capital);
 
         // Hybrid close: flatten large inventory at the touch once in the window.
         // Crossing the book makes us a TAKER, so a dynamic taker fee applies.
@@ -272,25 +352,39 @@ function simulate(windows: Window[], cfg: MakerConfig): SimMetrics {
         if (p <= 0 || sz <= 0) continue;
         if (timeToResolveSec <= cfg.flattenBeforeSec) continue; // not quoting in flatten window
 
-        // We capture at most `fillParticipation` of the crossing trade size
-        // (queue-position proxy). A trade fills at most one of our sides.
-        const avail = sz * cfg.fillParticipation;
+        // QUEUE MODEL (Step 3): a resting order only fills with the part of a
+        // crossing trade left AFTER the size ahead of us in the queue. If our
+        // price is worse than the touch (we're behind) or equal (we joined),
+        // the recorded top-of-book size sits ahead of us; only the overflow
+        // reaches us. If we improved past the touch, we're at the front.
+        // (Top-of-book size only -> underestimates queue at deeper levels, so
+        // still mildly optimistic; documented.) `fillParticipation` is an extra
+        // global haircut on top.
         if (bidPrice !== null && p <= bidPrice && bidRemaining > 0) {
-          // Hard inventory clamp: never let a buy push net long past the cap.
+          const queueAhead = bidPrice > bestBid ? 0 : bestBidSz; // front only if we improved; else size ahead
+          const reach = Math.max(0, sz - queueAhead) * cfg.fillParticipation;
           const clamp = Math.max(0, maxShares(bidPrice) - inv.shares);
-          const fillShares = Math.min(avail, bidRemaining, clamp);
+          const fillShares = Math.min(reach, bidRemaining, clamp);
           if (fillShares > 0) {
             inv = applyFill(inv, { side: 'BUY', price: bidPrice, shares: fillShares });
+            // Step 1: maker rebate = rebateRate * the taker fee our counterparty paid.
+            const rebate = w.rebateRate * takerFee(bidPrice, fillShares, w.feeRate);
+            inv = { ...inv, cashUsd: inv.cashUsd + rebate };
+            m.rebatesEarned += rebate;
             bidRemaining -= fillShares;
             m.fills++;
             m.buyShares += fillShares;
           }
         } else if (askPrice !== null && p >= askPrice && askRemaining > 0) {
-          // Hard inventory clamp: never let a sell push net short past the cap.
+          const queueAhead = askPrice < bestAsk ? 0 : bestAskSz; // front only if we improved; else size ahead
+          const reach = Math.max(0, sz - queueAhead) * cfg.fillParticipation;
           const clamp = Math.max(0, inv.shares + maxShares(askPrice));
-          const fillShares = Math.min(avail, askRemaining, clamp);
+          const fillShares = Math.min(reach, askRemaining, clamp);
           if (fillShares > 0) {
             inv = applyFill(inv, { side: 'SELL', price: askPrice, shares: fillShares });
+            const rebate = w.rebateRate * takerFee(askPrice, fillShares, w.feeRate);
+            inv = { ...inv, cashUsd: inv.cashUsd + rebate };
+            m.rebatesEarned += rebate;
             askRemaining -= fillShares;
             m.fills++;
             m.sellShares += fillShares;
@@ -327,9 +421,23 @@ function simulate(windows: Window[], cfg: MakerConfig): SimMetrics {
     h.pnl += windowPnl;
     h.windows++;
     m.byHour.set(hour, h);
+
+    const vb = m.byVol.get(w.volBucket) ?? { pnl: 0, windows: 0 };
+    vb.pnl += windowPnl;
+    vb.windows++;
+    m.byVol.set(w.volBucket, vb);
+
+    // Merge this window's per-bucket peak capital into the global timeline.
+    for (const [bkt, peak] of windowBucketPeak) {
+      concurrentCap.set(bkt, (concurrentCap.get(bkt) ?? 0) + peak);
+    }
   }
 
   m.meanAbsInvUsd = invSamples > 0 ? invSampleSum / invSamples : 0;
+  m.grossSpreadPnl = m.totalPnl - m.rebatesEarned;
+  const capLevels = [...concurrentCap.values()];
+  m.peakConcurrentUsd = capLevels.length ? Math.max(...capLevels) : 0;
+  m.meanConcurrentUsd = capLevels.length ? capLevels.reduce((s, x) => s + x, 0) / capLevels.length : 0;
   return m;
 }
 
@@ -341,7 +449,7 @@ function report(label: string, m: SimMetrics): void {
   const best = sorted[sorted.length - 1] ?? 0;
   console.log(`\n=== ${label} ===`);
   console.log(`windows simulated   : ${m.windows}`);
-  console.log(`total P&L           : ${fmtUsd(m.totalPnl)}`);
+  console.log(`total P&L           : ${fmtUsd(m.totalPnl)}  (spread ${fmtUsd(m.grossSpreadPnl)} + rebate ${fmtUsd(m.rebatesEarned)})`);
   console.log(`P&L per window      : ${fmtUsd(m.windows ? m.totalPnl / m.windows : 0)}`);
   console.log(`winning windows     : ${wins}/${m.windows} (${pct(wins, m.windows)})`);
   console.log(`best / worst window : ${fmtUsd(best)} / ${fmtUsd(worst)}`);
@@ -356,6 +464,7 @@ function report(label: string, m: SimMetrics): void {
   console.log(`taker fees paid     : ${fmtUsd(-m.takerFeesPaid)} (on flattens; maker fills are free)`);
   console.log(`held residuals      : ${m.heldResiduals}`);
   console.log(`settled at real 0/1 : ${m.outcomeSettled}/${m.windows} (rest marked at mid)`);
+  console.log(`capital deployed    : peak ${fmtUsd(m.peakConcurrentUsd)} / mean ${fmtUsd(m.meanConcurrentUsd)} (concurrent across windows)`);
 }
 
 function reportBreakdowns(m: SimMetrics): void {
@@ -366,6 +475,11 @@ function reportBreakdowns(m: SimMetrics): void {
   console.log(`  -- P&L by UTC hour --`);
   for (const [hour, v] of [...m.byHour.entries()].sort((a, b) => a[0] - b[0])) {
     console.log(`     ${String(hour).padStart(2)}:00 ${fmtUsd(v.pnl).padStart(10)}  (${v.windows} windows)`);
+  }
+  console.log(`  -- P&L by BTC volatility bucket (per-window mean |R30|) --`);
+  for (const k of ['low', 'mid', 'high']) {
+    const v = m.byVol.get(k);
+    if (v) console.log(`     ${k.padEnd(5)} ${fmtUsd(v.pnl).padStart(10)}  (${v.windows} windows)`);
   }
 }
 
@@ -380,18 +494,23 @@ function main(): void {
   const args = process.argv.slice(2);
   const tapePaths: string[] = [];
   let singleSpread: number | null = null;
+  let assetFilter: Set<string> | null = null;
   for (let i = 0; i < args.length; i++) {
     if (args[i] === '--spread') singleSpread = Number(args[++i]);
+    else if (args[i] === '--assets') assetFilter = new Set(args[++i].toUpperCase().split(','));
     else if (!args[i].startsWith('--')) tapePaths.push(resolve(args[i]));
   }
   const paths = tapePaths.length ? tapePaths : allTapes();
 
   const cfg = loadBotYaml();
-  const windows = loadWindows(paths);
+  let windows = loadWindows(paths);
+  if (assetFilter) windows = windows.filter((w) => assetFilter!.has(w.asset));
+  assignVolBuckets(windows); // Step 4: tag low/mid/high by global terciles
   console.log(`Loaded ${windows.length} market windows from ${paths.length} tape(s):`);
   for (const p of paths) console.log(`  - ${p}`);
+  if (assetFilter) console.log(`Asset filter: ${[...assetFilter].join(',')}`);
   console.log(
-    `Realism knobs: fill_participation=${cfg.maker.fillParticipation}, taker_fee_rate=${cfg.maker.takerFeeRate}`,
+    `Realism knobs: fill_participation=${cfg.maker.fillParticipation}, taker_fee_rate=${cfg.maker.takerFeeRate}, queue model ON`,
   );
   if (windows.length === 0) {
     console.log('No complete windows with metadata to simulate. Record more tape.');
