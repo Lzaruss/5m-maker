@@ -40,7 +40,7 @@
 import { loadBotYaml, loadEnv, assertLiveEnv, type BotConfig } from './util/config.js';
 import { logger } from './util/logger.js';
 import { getUsdcBalance } from './clob/client.js';
-import { fetchMarkets, fetchResolution, type ShortMarket } from './markets/gammaPoller.js';
+import { fetchMarkets, fetchResolution, gammaBackoffMs, type ShortMarket } from './markets/gammaPoller.js';
 import { PriceFeed } from './signals/priceFeed.js';
 import { ClobMarketFeed, type BookSnapshot } from './marketFeed/clobMarketFeed.js';
 import { computeQuotes } from './engine/quoter.js';
@@ -62,6 +62,8 @@ import {
   marketFlatten,
   isThrottled,
   throttleRemainingMs,
+  isSellBalanceRejected,
+  clearSellBalanceRejected,
 } from './clob/orders.js';
 import { fetchOurTrades } from './clob/trades.js';
 import { logEvent, closeLog } from './persistence/eventLog.js';
@@ -288,7 +290,11 @@ async function main(): Promise<void> {
       .sort((a, b) => a.resolvesAt.getTime() - b.resolvesAt.getTime())[0];
 
     if (!market) {
-      await sleep(2000);
+      // Use exponential backoff during Gamma API outages — without this the
+      // 2s retry floods the log and burns rate-limit budget. Returns 0 when
+      // Gamma is healthy (empty result means "no matching market right now").
+      const backoff = gammaBackoffMs();
+      await sleep(Math.max(2000, backoff));
       continue;
     }
 
@@ -301,6 +307,8 @@ async function main(): Promise<void> {
       { tokenId: market.yesTokenId, label: 'YES', account: emptyAccount(), sinceMs: windowSinceMs, flattened: false, buyNotionalCommitted: 0 },
       { tokenId: market.noTokenId, label: 'NO', account: emptyAccount(), sinceMs: windowSinceMs, flattened: false, buyNotionalCommitted: 0 },
     ];
+    // Clear any SELL suppression from the previous window so both legs start clean.
+    for (const leg of legs) clearSellBalanceRejected(leg.tokenId);
 
     logEvent({
       kind: 'window_open',
@@ -543,8 +551,15 @@ async function main(): Promise<void> {
               kind: 'flatten', token: leg.tokenId, leg: leg.label, side, shares, refPrice, invUsd,
             });
             logger.warn({ leg: leg.label, side, shares, refPrice, invUsd }, 'flattening residual inventory');
-            const ok = enabled ? await marketFlatten(leg.tokenId, side, shares, refPrice) : true;
-            if (ok) leg.flattened = true;
+            // Mark as flattened BEFORE the call so that if the FOK is rejected
+            // (no liquidity near window close) we do NOT retry every tick for
+            // 30 seconds — a tight loop that previously fired 54 times on a
+            // single token and spammed the venue with failing taker orders.
+            // One attempt is enough: if the FOK fills we're flat; if it's
+            // rejected, the position settles at resolution price (often better
+            // than the 0.76-0.84 bids available in the final seconds anyway).
+            leg.flattened = true;
+            if (enabled) await marketFlatten(leg.tokenId, side, shares, refPrice);
           }
         }
         continue;
@@ -635,8 +650,8 @@ async function main(): Promise<void> {
         const spendBlock = computeSpendBlock(leg.buyNotionalCommitted, cfg.maker.maxSpendPerLegUsd);
 
         // Desired resting orders for this leg — all suppression rules (cross
-        // filter, naked-SELL guard, hedge/spend caps, disable_sell) live in the
-        // pure, unit-tested buildDesired.
+        // filter, naked-SELL guard, hedge/spend caps, disable_sell, and
+        // balance-error suppression) live in the pure, unit-tested buildDesired.
         const desired = buildDesired({
           decision,
           halted: gates.halted,
@@ -647,7 +662,7 @@ async function main(): Promise<void> {
           legShares: leg.account.shares,
           hedgeBlocksBuy: hedgeBlock,
           spendBlocksBuy: spendBlock,
-          disableSell: cfg.maker.disableSell,
+          disableSell: cfg.maker.disableSell || isSellBalanceRejected(leg.tokenId),
         });
 
         if (hedgeBlock) hedgeBlockCount++;

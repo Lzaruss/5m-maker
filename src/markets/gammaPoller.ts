@@ -81,17 +81,84 @@ function parseTokenIds(raw: any): string[] {
   return [];
 }
 
+// ---------------------------------------------------------------------------
+// Gamma API circuit breaker.
+//
+// Polymarket's Gamma API occasionally goes 500 for minutes at a time. Without
+// backoff our 2s poll cycle floods the log with hundreds of identical errors
+// and burns rate-limit budget. This tracks consecutive failures and exposes
+// the recommended sleep so the orchestrator can wait before retrying. Backoff
+// is exponential capped at 60s with ±20% jitter; one success resets it.
+// Logging is throttled to (first failure) + (every 30s during outage) +
+// (recovery).
+//
+// Additionally, fetchMarkets / fetchResolution retry 5xx responses up to
+// GAMMA_MAX_RETRIES times (with a 1s pause) before escalating to the circuit
+// breaker. This absorbs the short-lived transient 500s that Polymarket emits
+// occasionally without incrementing the failure counter.
+// ---------------------------------------------------------------------------
+let gammaFailures = 0;
+let lastErrorLogMs = 0;
+
+const GAMMA_MAX_RETRIES = 2;
+const GAMMA_RETRY_DELAY_MS = 1_000;
+
+/** Recommended ms to sleep before the next fetchMarkets attempt. 0 if healthy.
+ *  Includes ±20% jitter to prevent a thundering-herd if multiple processes
+ *  restart simultaneously. */
+export function gammaBackoffMs(): number {
+  if (gammaFailures === 0) return 0;
+  const base = Math.min(60_000, 2_000 * Math.pow(2, gammaFailures - 1)); // 2,4,8,16,32,60,60...
+  const jitter = base * 0.2 * (Math.random() * 2 - 1); // ±20%
+  return Math.round(base + jitter);
+}
+
+/** Returns true when the error is a server-side 5xx that is worth retrying. */
+function isRetryable(err: any): boolean {
+  const status: number | undefined = err?.response?.status;
+  return status !== undefined && status >= 500 && status < 600;
+}
+
+/** Sleep helper local to this module. */
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
 /**
  * Fetch imminent Up/Down markets for the given assets and window size.
- * Sorted soonest-resolving first.
+ * Sorted soonest-resolving first. Returns [] on error AND on no-match.
  */
 export async function fetchMarkets(assets: Asset[], windowMin: number): Promise<ShortMarket[]> {
   try {
     const nowIso = new Date().toISOString();
     const url = `${GAMMA}/markets?active=true&closed=false&limit=500&order=endDate&ascending=true&end_date_min=${encodeURIComponent(nowIso)}`;
-    const response = await axios.get<GammaMarketRaw[]>(url, { timeout: 15000 });
+
+    let response: Awaited<ReturnType<typeof axios.get<GammaMarketRaw[]>>>;
+    let attempt = 0;
+    while (true) {
+      try {
+        response = await axios.get<GammaMarketRaw[]>(url, { timeout: 15000 });
+        break;
+      } catch (retryErr: any) {
+        attempt++;
+        if (attempt <= GAMMA_MAX_RETRIES && isRetryable(retryErr)) {
+          logger.debug(
+            { attempt, status: retryErr?.response?.status },
+            'Gamma fetchMarkets 5xx — retrying',
+          );
+          await sleep(GAMMA_RETRY_DELAY_MS);
+          continue;
+        }
+        throw retryErr;
+      }
+    }
     const raw = Array.isArray(response.data) ? response.data : [];
     const wanted = new Set(assets);
+
+    if (gammaFailures > 0) {
+      logger.info({ priorFailures: gammaFailures }, 'Gamma API recovered');
+    }
+    gammaFailures = 0;
 
     const out: ShortMarket[] = [];
     for (const m of raw) {
@@ -132,7 +199,18 @@ export async function fetchMarkets(assets: Asset[], windowMin: number): Promise<
     logger.debug({ count: out.length, assets, windowMin }, 'Fetched markets');
     return out;
   } catch (err: any) {
-    logger.error({ error: err.message }, 'Failed to fetch Gamma markets');
+    gammaFailures++;
+    // Throttle logging: warn on the first failure, then only once per 30s
+    // during the outage. The orchestrator already pauses with backoff so
+    // there's no decision being made on every silent retry.
+    const now = Date.now();
+    if (gammaFailures === 1 || now - lastErrorLogMs >= 30_000) {
+      logger.warn(
+        { error: err.message, consecutiveFailures: gammaFailures, nextBackoffMs: gammaBackoffMs() },
+        'Gamma API failing',
+      );
+      lastErrorLogMs = now;
+    }
     return [];
   }
 }
@@ -193,7 +271,26 @@ export async function fetchResolution(
 ): Promise<Resolution | null> {
   try {
     const url = `${GAMMA}/markets?clob_token_ids=${encodeURIComponent(yesTokenId)}`;
-    const resp = await axios.get<GammaMarketRaw[] | GammaMarketRaw>(url, { timeout: 15000 });
+
+    let resp: Awaited<ReturnType<typeof axios.get<GammaMarketRaw[] | GammaMarketRaw>>>;
+    let attempt = 0;
+    while (true) {
+      try {
+        resp = await axios.get<GammaMarketRaw[] | GammaMarketRaw>(url, { timeout: 15000 });
+        break;
+      } catch (retryErr: any) {
+        attempt++;
+        if (attempt <= GAMMA_MAX_RETRIES && isRetryable(retryErr)) {
+          logger.debug(
+            { attempt, status: retryErr?.response?.status },
+            'Gamma fetchResolution 5xx — retrying',
+          );
+          await sleep(GAMMA_RETRY_DELAY_MS);
+          continue;
+        }
+        throw retryErr;
+      }
+    }
     const m: any = Array.isArray(resp.data) ? resp.data[0] : resp.data;
     if (!m) return null;
 

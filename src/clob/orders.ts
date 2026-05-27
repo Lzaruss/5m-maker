@@ -18,6 +18,29 @@ export interface PlacedOrder { orderId: string; side: 'BUY' | 'SELL'; price: num
 let consecutiveFailures = 0;
 let throttleUntilMs = 0;
 
+// ---------------------------------------------------------------------------
+// Per-token SELL balance suppression.
+//
+// When the venue returns HTTP 400 "not enough balance" on a SELL placement it
+// means our tracked inventory is ahead of on-chain truth (poll lag / missed
+// fill event). Retrying the same SELL every 1.5 s floods the log and burns
+// the rate-limit budget without ever succeeding. We suppress SELL for that
+// token for the rest of the window; the reconciler will correct tracked shares
+// at the next on-chain check and the next window starts clean.
+// ---------------------------------------------------------------------------
+const sellBalanceRejected = new Set<string>();
+
+/** True when a SELL on this token was rejected with "not enough balance" and
+ *  should be skipped until the next window clears the flag. */
+export function isSellBalanceRejected(tokenId: string): boolean {
+  return sellBalanceRejected.has(tokenId);
+}
+
+/** Call at window open to allow SELL orders again for this token. */
+export function clearSellBalanceRejected(tokenId: string): void {
+  sellBalanceRejected.delete(tokenId);
+}
+
 function backoffMs(n: number): number {
   // 5s, 10s, 20s, 40s, 60s, 60s, ...
   return Math.min(60_000, 5_000 * Math.pow(2, Math.max(0, n - 1)));
@@ -74,6 +97,22 @@ export async function placeLimitMaker(
       const status = Number(result?.status ?? 0);
       const transient = status === 425 || status === 429 || status >= 500;
       if (transient) recordFailure();
+
+      // Detect "not enough balance" on SELL (tracked inventory ahead of
+      // on-chain truth due to poll lag). Suppress further SELLs for this
+      // token this window instead of looping on the same 400 every tick.
+      const rawStr: string = JSON.stringify(result ?? '');
+      const balanceError =
+        side === 'SELL' && status === 400 && rawStr.includes('not enough balance');
+      if (balanceError) {
+        sellBalanceRejected.add(tokenId);
+        logger.warn(
+          { tokenId: tokenId.slice(0, 10), side, price, size: Number(sizeShares.toFixed(2)), status },
+          'placeLimitMaker: SELL balance insufficient — suppressing SELL for this token until next window',
+        );
+        return null;
+      }
+
       logger.warn(
         {
           tokenId: tokenId.slice(0, 10),

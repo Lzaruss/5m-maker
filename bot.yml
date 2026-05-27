@@ -5,22 +5,24 @@
 assets: [BTC, ETH, SOL, XRP, BNB, DOGE]
 
 maker:
-  # === Tightening config (2026-05-27) ===
-  # Goal: improve fill quality (reduce adverse-selection cost) at the price
-  # of fewer fills. The 50-55% win rate we saw bleeds in this regime; aiming
-  # for fewer-but-better entries to push win rate >60%.
-  half_spread: 0.05            # ↑ from 0.03 — quote deeper, better avg entry, fewer adverse fills
+  # === Rebalance 2026-05-27 morning ===
+  # Previous tightening combo (half_spread 0.05 + adverse pull 0.0004 + spend
+  # cap 3 + inv cap 2 + max_buy 0.5) froze the bot: 4 places in 12 min, 25%
+  # of reconciles in `both_sides_pulled`. Reopening selectively while KEEPING
+  # the structural max_buy_price fix and tight loss caps.
+  half_spread: 0.04            # compromise (was 0.05 frozen / 0.03 too tight)
   quote_size_usd: 2.0          # unchanged
   min_quote_shares: 5.0        # Polymarket min_order_size floor
-  inventory_skew_k: 0.2        # ↓ from 0.4 — less aggressive ask drop when long (prevents fire-sale SELLs)
+  inventory_skew_k: 0.2        # gentle skew — keeps SELL from going fire-sale
   widen_factor: 2.5            # widen on volatility
-  max_inventory_usd: 2.0       # VALIDATION MODE
+  max_inventory_usd: 2.5       # slight bump from 2.0 — allow 1 fill of 5 sh
   tick_size: 0.01              # price granularity for rounding quotes
 
   # ── Strategy mode ─────────────────────────────────────────────────────────
-  # SELL re-enabled. Combined with the controls below, the previous fire-sale
-  # scenario (canary-4 selling YES @ 0.19 after buying at 0.26-0.41) should
-  # be prevented because hedge/spend caps stop runaway accumulation.
+  # SELL re-enabled (2026-05-27 rebalance). The fire-sale risk is now prevented
+  # structurally by max_buy_price, hedge cap, and spend cap — not by disabling
+  # the SELL side entirely. Keeping disable_sell=true was turning the bot into
+  # a pure lottery (BUY only, hold to resolution) rather than a market-maker.
   disable_sell: false
 
   # ── Control knobs ────────────────────────────────────────────────────────
@@ -31,16 +33,18 @@ maker:
   # At p=0.65, R/R is 0.54:1 (needs 65% win rate; we have no directional info).
   # Restricting BUYs to the "underdog" side (price <= 0.5) keeps R/R >= 1:1
   # on every entry. Asymmetric — does NOT affect SELL placement.
-  max_buy_price: 0.50          # never post BUY above this price
-  max_unmatched_shares: 4      # VALIDATION MODE: tighter hedge cap
-  max_spend_per_leg_usd: 3     # VALIDATION MODE: smaller per-window exposure per leg
+  max_buy_price: 0.50          # never post BUY above this price (STRUCTURAL FIX, keep)
+  max_unmatched_shares: 5      # back to 5 (was 4) — allow 1 unmatched fill per side
+  max_spend_per_leg_usd: 4     # ↑ from 3 — was hitting cap in 30s and going idle
   replace_deadband_ticks: 3    # only cancel+replace if desired moved >= this many ticks
 
   adverse_guard:
-    # Tighter thresholds — pull the vulnerable side sooner during BTC moves.
-    # Informed flow is faster than our 1.5s poll cycle; we need to react earlier.
-    btc_return_30s_widen: 0.0002  # ↓ from 0.0003 — widen at smaller moves (0.02% in 30s)
-    btc_return_30s_pull: 0.0004   # ↓ from 0.0007 — pull side at 0.04% move (was 0.07%)
+    # Relaxed from the over-tight 0.0002/0.0004 that was triggering on every
+    # BTC vibration. BTC routinely moves 0.05-0.10% in 30s, so 0.04% pull
+    # threshold was pulling ~25% of the time. New values are a compromise
+    # between the original loose 0.0005/0.0010 and the over-tight new ones.
+    btc_return_30s_widen: 0.0003  # widen at 0.03% in 30s
+    btc_return_30s_pull: 0.0006   # pull at 0.06% in 30s
 
   flatten_before_sec: 30       # boundary where we cancel resting BUYs and (unless disable_sell) market-flatten residual
   flatten_if_net_above_usd: 1.0  # threshold for flatten when natural flatten phase runs
@@ -56,10 +60,9 @@ risk:
 live:
   enabled: true           # real money — kill switch is `npm run cancel-all`
   assets: [BTC]
-  max_deployed_usd: 6     # VALIDATION MODE: tighter cap while verifying fetchOurTrades fix
-  # VALIDATION caps — extra tight while we confirm the realizedSessionUsd
-  # tracked by the bot now matches the on-chain wallet balance delta.
-  # Move back to 5/8 (Tier 1) only after 24h with no leak.
+  max_deployed_usd: 8     # ↑ from 6 — matches max_spend (4+4) + small inventory headroom
+  # Loss caps KEPT TIGHT — we want to detect any new leak with the on-chain
+  # reconciler ASAP. Don't raise these until 12h of clean operation.
   daily_loss_halt_usd: 2  # idle until 00:00 UTC after $2 realized loss
   session_loss_halt_usd: 3  # EXIT process after $3 cumulative realized loss since start
   poll_interval_ms: 1500
