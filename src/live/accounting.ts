@@ -19,3 +19,40 @@ export function applyTrade(a: Account, t: Trade): Account {
 export function pnl(a: Account, settle: number): number {
   return a.cashUsd + a.shares * settle;
 }
+
+export interface ReconcileResult {
+  account: Account;
+  /** onchainShares - trackedShares (positive = we held more than we thought). */
+  drift: number;
+  corrected: boolean;
+}
+
+/**
+ * Reconcile a tracked account against the TRUE on-chain share count. The fill
+ * poller can miss/lag trades, leaving `account.shares` wrong — which is how the
+ * stuck-position leak happened. When the gap exceeds `toleranceShares` we snap
+ * `shares` to the on-chain truth and adjust cash by `drift * avgPrice` using the
+ * venue's real cost basis, so `pnl()` stays consistent.
+ *
+ * Pure. `avgPrice` is the on-chain volume-weighted cost; for the dangerous
+ * direction (missed BUYs -> drift > 0) it is exactly right. For drift < 0
+ * (untracked sells) it is an approximation (cost basis, not sale price).
+ */
+export function reconcileAccount(
+  a: Account,
+  onchainShares: number,
+  avgPrice: number,
+  toleranceShares = 0.5,
+): ReconcileResult {
+  const drift = onchainShares - a.shares;
+  if (Math.abs(drift) <= toleranceShares) {
+    return { account: a, drift, corrected: false };
+  }
+  // We acquired `drift` shares we didn't book -> we spent ~drift*avgPrice cash.
+  const account: Account = {
+    shares: onchainShares,
+    cashUsd: a.cashUsd - drift * avgPrice,
+    seen: a.seen,
+  };
+  return { account, drift, corrected: true };
+}

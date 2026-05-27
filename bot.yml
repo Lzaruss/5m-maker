@@ -63,3 +63,5 @@ live:
   daily_loss_halt_usd: 2  # idle until 00:00 UTC after $2 realized loss
   session_loss_halt_usd: 3  # EXIT process after $3 cumulative realized loss since start
   poll_interval_ms: 1500
+  reconcile_every_sec: 30   # on-chain position drift check cadence (0 disables)
+  reconcile_correct: true   # snap tracked shares to on-chain truth on drift (false = log-only)

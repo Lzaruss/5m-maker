@@ -83,6 +83,13 @@ export interface LiveConfig {
    *  even if a new UTC day starts with a fresh daily-halt budget. */
   sessionLossHaltUsd: number;
   pollIntervalMs: number;
+  /** Seconds between on-chain position reconciliation checks (drift detection
+   *  against the venue's true holdings). 0 disables the periodic check. */
+  reconcileEverySec: number;
+  /** When true, a detected drift snaps tracked shares to the on-chain truth
+   *  (and adjusts cash at cost basis). When false, drift is only LOGGED — useful
+   *  for observe-only validation before trusting the correction. */
+  reconcileCorrect: boolean;
 }
 
 export interface BotConfig {
@@ -152,6 +159,8 @@ export function parseBotYaml(raw: string): BotConfig {
     // hits in normal use. Set explicitly in bot.yml for tight overnight safety.
     sessionLossHaltUsd: lv.session_loss_halt_usd ?? (lv.daily_loss_halt_usd ?? 20) * 2,
     pollIntervalMs: lv.poll_interval_ms ?? 1500,
+    reconcileEverySec: lv.reconcile_every_sec ?? 30,
+    reconcileCorrect: lv.reconcile_correct ?? true,
   };
   return { assets, maker, risk, live };
 }

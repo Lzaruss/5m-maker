@@ -46,7 +46,14 @@ import { ClobMarketFeed, type BookSnapshot } from './marketFeed/clobMarketFeed.j
 import { computeQuotes } from './engine/quoter.js';
 import { checkGates } from './live/riskGate.js';
 import { reconcile, type DesiredQuote, type LiveOrder } from './live/reconciler.js';
-import { emptyAccount, applyTrade, pnl, type Account } from './live/accounting.js';
+import { emptyAccount, applyTrade, pnl, reconcileAccount, type Account } from './live/accounting.js';
+import {
+  buildDesired,
+  hedgeBlocksBuy as computeHedgeBlock,
+  spendBlocksBuy as computeSpendBlock,
+  legSettlePrice,
+} from './live/legPolicy.js';
+import { fetchOnchainShares } from './clob/reconcileInventory.js';
 import {
   placeLimitMaker,
   cancelByIds,
@@ -247,6 +254,8 @@ async function main(): Promise<void> {
   let winningWindows = 0;
   let losingWindows = 0;
   const SUMMARY_INTERVAL_MS = 5 * 60_000;
+  // Last on-chain reconciliation timestamp (0 => fire on the first eligible tick).
+  let lastReconcileMs = 0;
 
   // ------------------------------------------------------------------ outer loop
   // eslint-disable-next-line no-constant-condition
@@ -386,6 +395,55 @@ async function main(): Promise<void> {
             price: t.price,
             shares: t.shares,
           });
+        }
+      }
+
+      // 1b. ON-CHAIN RECONCILIATION (drift guard). The fill poller can lag/miss
+      //     trades; periodically compare tracked shares to the venue's true
+      //     holdings. When we hold a real position the tracker under-counts
+      //     (the stuck-position leak), snap to truth and debit cash at the real
+      //     cost basis. The ambiguous "tracked>0 but none on-chain" case is only
+      //     LOGGED (likely poll lag or post-resolution worthless) — never auto-
+      //     zeroed, which would fabricate PnL.
+      if (
+        cfg.live.reconcileEverySec > 0 &&
+        Date.now() - lastReconcileMs >= cfg.live.reconcileEverySec * 1000
+      ) {
+        lastReconcileMs = Date.now();
+        const onchain = await fetchOnchainShares(legs.map((l) => l.tokenId));
+        if (onchain) {
+          for (const leg of legs) {
+            const oc = onchain.get(leg.tokenId);
+            if (oc) {
+              const before = leg.account.shares;
+              const r = reconcileAccount(leg.account, oc.shares, oc.avgPrice);
+              logEvent({
+                kind: 'reconcile_check',
+                token: leg.tokenId,
+                leg: leg.label,
+                tracked: before,
+                onchain: oc.shares,
+                avgPrice: oc.avgPrice,
+                drift: r.drift,
+                corrected: r.corrected && cfg.live.reconcileCorrect,
+              });
+              if (r.corrected && cfg.live.reconcileCorrect) {
+                leg.account = r.account;
+                logger.warn(
+                  { leg: leg.label, before, onchain: oc.shares, avgPrice: oc.avgPrice, drift: r.drift },
+                  'inventory drift CORRECTED to on-chain truth',
+                );
+              }
+            } else if (Math.abs(leg.account.shares) > 0.5) {
+              logEvent({
+                kind: 'reconcile_phantom',
+                token: leg.tokenId,
+                leg: leg.label,
+                tracked: leg.account.shares,
+                note: 'tracked shares but none on-chain (poll lag or worthless) — not auto-zeroed',
+              });
+            }
+          }
         }
       }
 
@@ -565,50 +623,35 @@ async function main(): Promise<void> {
         // `maxUnmatchedShares`, BUY is suppressed on this leg until the other
         // catches up — forces matched-pair accumulation. Bounds worst-case
         // single-window directional exposure to ~maxUnmatchedShares * $1.
+        // Hedge + spend caps (pure helpers in legPolicy). hedge cap forces
+        // matched-pair accumulation; spend cap bounds per-leg per-window outlay.
         const otherLeg = legs.find((l) => l.tokenId !== leg.tokenId);
         const sharesDiff = leg.account.shares - (otherLeg?.account.shares ?? 0);
-        const hedgeBlocksBuy = sharesDiff >= cfg.maker.maxUnmatchedShares;
+        const hedgeBlock = computeHedgeBlock(
+          leg.account.shares,
+          otherLeg?.account.shares ?? 0,
+          cfg.maker.maxUnmatchedShares,
+        );
+        const spendBlock = computeSpendBlock(leg.buyNotionalCommitted, cfg.maker.maxSpendPerLegUsd);
 
-        // Per-leg per-window spend cap (immune to /activity polling lag).
-        const spendBlocksBuy =
-          leg.buyNotionalCommitted >= cfg.maker.maxSpendPerLegUsd;
+        // Desired resting orders for this leg — all suppression rules (cross
+        // filter, naked-SELL guard, hedge/spend caps, disable_sell) live in the
+        // pure, unit-tested buildDesired.
+        const desired = buildDesired({
+          decision,
+          halted: gates.halted,
+          allowBuy: gates.allowBuy,
+          allowSell: gates.allowSell,
+          bestBid,
+          bestAsk,
+          legShares: leg.account.shares,
+          hedgeBlocksBuy: hedgeBlock,
+          spendBlocksBuy: spendBlock,
+          disableSell: cfg.maker.disableSell,
+        });
 
-        const desired: DesiredQuote[] = [];
-        if (!gates.halted && decision.action === 'quote') {
-          // Pre-flight cross check: we use postOnly on every order. A quote
-          // that would CROSS the current touch (BUY at/above bestAsk, SELL
-          // at/below bestBid) is rejected by the venue with no benefit. Filter
-          // here so we don't burn an API call and (importantly) don't accumulate
-          // toward the venue rate-limit. Common when a fresh mid arrives
-          // between our last book read and the cancel/replace tick.
-          if (
-            decision.bid &&
-            gates.allowBuy &&
-            !hedgeBlocksBuy &&
-            !spendBlocksBuy &&
-            decision.bid.price < bestAsk
-          ) {
-            desired.push({ side: 'BUY', price: decision.bid.price, size: decision.bid.sizeShares });
-          }
-          // SELL handling:
-          //  - disable_sell: never post SELL (BUY-only / hold-to-resolution).
-          //  - Suppressed when shares < ask.size — naked SELL is rejected
-          //    by the venue with "insufficient balance".
-          //  - Suppressed when ask.price <= bestBid — postOnly would reject
-          //    (this was 99% of the place_fail count in canary-7).
-          if (
-            !cfg.maker.disableSell &&
-            decision.ask &&
-            gates.allowSell &&
-            leg.account.shares >= decision.ask.sizeShares &&
-            decision.ask.price > bestBid
-          ) {
-            desired.push({ side: 'SELL', price: decision.ask.price, size: decision.ask.sizeShares });
-          }
-        }
-
-        if (hedgeBlocksBuy) hedgeBlockCount++;
-        if (spendBlocksBuy) spendBlockCount++;
+        if (hedgeBlock) hedgeBlockCount++;
+        if (spendBlock) spendBlockCount++;
         const { toCancel, toPlace } = reconcile(
           openByToken[leg.tokenId],
           desired,
@@ -621,8 +664,8 @@ async function main(): Promise<void> {
           leg: leg.label,
           reason: decision.reason,
           gate: gates.reason,
-          hedgeBlocksBuy,
-          spendBlocksBuy,
+          hedgeBlocksBuy: hedgeBlock,
+          spendBlocksBuy: spendBlock,
           spent: leg.buyNotionalCommitted,
           toCancel,
           toPlace,
@@ -722,13 +765,7 @@ async function main(): Promise<void> {
     let windowPnl = 0;
     for (const leg of legs) {
       const fallback = legMidFromBook(books.get(leg.tokenId));
-      let settle: number;
-      if (res) {
-        const yesWon = res.yesWon;
-        settle = leg.label === 'YES' ? (yesWon ? 1 : 0) : (yesWon ? 0 : 1);
-      } else {
-        settle = fallback;
-      }
+      const settle: number = res ? legSettlePrice(leg.label, res.yesWon) : fallback;
       const legPnl = pnl(leg.account, settle);
       windowPnl += legPnl;
       logEvent({
