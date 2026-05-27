@@ -10,7 +10,7 @@ maker:
   min_quote_shares: 5.0        # Polymarket min_order_size floor
   inventory_skew_k: 0.4        # bid/ask skew strength when inventory is non-zero
   widen_factor: 2.5            # widen on volatility
-  max_inventory_usd: 3.0       # per-leg cap on inventory notional (lagged — see max_spend_per_leg_usd)
+  max_inventory_usd: 2.0       # VALIDATION MODE: tighter while we verify the fetchOurTrades fix
   tick_size: 0.01              # price granularity for rounding quotes
 
   # ── Strategy mode ─────────────────────────────────────────────────────────
@@ -19,11 +19,11 @@ maker:
   # be prevented because hedge/spend caps stop runaway accumulation.
   disable_sell: false
 
-  # ── Control knobs added 2026-05-26 21:15 UTC ─────────────────────────────
+  # ── Control knobs ────────────────────────────────────────────────────────
   quote_price_min: 0.05        # refuse to quote below this price (no lottery-ticket BUYs)
   quote_price_max: 0.95        # refuse to quote above this price (no extreme SELLs)
-  max_unmatched_shares: 5      # hedge cap — stop posting BUY on the leg with too many shares vs the other
-  max_spend_per_leg_usd: 5     # hard cap on cumulative BUY notional placed per leg per window (immune to /activity lag)
+  max_unmatched_shares: 4      # VALIDATION MODE: tighter hedge cap
+  max_spend_per_leg_usd: 3     # VALIDATION MODE: smaller per-window exposure per leg
   replace_deadband_ticks: 3    # only cancel+replace if desired moved >= this many ticks (reduces cancel-fill race)
 
   adverse_guard:
@@ -44,11 +44,10 @@ risk:
 live:
   enabled: true           # real money — kill switch is `npm run cancel-all`
   assets: [BTC]
-  max_deployed_usd: 10    # hard cap across BOTH legs (YES+NO BUY notional + |inv|)
-  # Tier 1 loss limits — raised after 7h36m overnight session that grossed
-  # +$15 with a -$6.28 intra-session drawdown. Old caps (3/5) would have
-  # halted us mid-grind on a normal pullback. New caps allow the strategy's
-  # natural variance without blocking it.
-  daily_loss_halt_usd: 5  # idle until 00:00 UTC after $5 realized loss on the UTC day
-  session_loss_halt_usd: 8  # EXIT process after $8 cumulative realized loss since start
+  max_deployed_usd: 6     # VALIDATION MODE: tighter cap while verifying fetchOurTrades fix
+  # VALIDATION caps — extra tight while we confirm the realizedSessionUsd
+  # tracked by the bot now matches the on-chain wallet balance delta.
+  # Move back to 5/8 (Tier 1) only after 24h with no leak.
+  daily_loss_halt_usd: 2  # idle until 00:00 UTC after $2 realized loss
+  session_loss_halt_usd: 3  # EXIT process after $3 cumulative realized loss since start
   poll_interval_ms: 1500
