@@ -8,7 +8,7 @@
     "typecheck": "tsc --noEmit",
     "start": "npm run tsnode -- src/index.ts",
     "build": "tsc",
-    "tsnode": "node --import \"data:text/javascript,import { register } from 'node:module'; import { pathToFileURL } from 'node:url'; register('ts-node/esm', pathToFileURL('./'));\"",
+    "tsnode": "node --no-deprecation --import \"data:text/javascript,import { register } from 'node:module'; import { pathToFileURL } from 'node:url'; register('ts-node/esm', pathToFileURL('./'));\"",
     "test": "vitest",
     "test:run": "vitest run",
     "record": "npm run tsnode -- scripts/recorder.ts",

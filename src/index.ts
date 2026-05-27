@@ -284,9 +284,13 @@ async function main(): Promise<void> {
     }
 
     const resolvesAtMs = market.resolvesAt.getTime();
+    // sinceMs floor for fetchOurTrades. Start 60s BEFORE window open so any
+    // fill that happens in the first second of the window (before our first
+    // poll) is still captured. fetchOurTrades adds its own slack on top.
+    const windowSinceMs = Date.now() - 60_000;
     const legs: TokenLeg[] = [
-      { tokenId: market.yesTokenId, label: 'YES', account: emptyAccount(), sinceMs: Date.now(), flattened: false, buyNotionalCommitted: 0 },
-      { tokenId: market.noTokenId, label: 'NO', account: emptyAccount(), sinceMs: Date.now(), flattened: false, buyNotionalCommitted: 0 },
+      { tokenId: market.yesTokenId, label: 'YES', account: emptyAccount(), sinceMs: windowSinceMs, flattened: false, buyNotionalCommitted: 0 },
+      { tokenId: market.noTokenId, label: 'NO', account: emptyAccount(), sinceMs: windowSinceMs, flattened: false, buyNotionalCommitted: 0 },
     ];
 
     logEvent({
@@ -364,13 +368,15 @@ async function main(): Promise<void> {
         lastSummaryMs = Date.now();
       }
 
-      // 1. Pull fills for each leg independently.
+      // 1. Pull fills for each leg independently. We do NOT advance sinceMs
+      //    based on individual fills — that previously dropped late-arriving
+      //    fills permanently and led to the 2026-05-27 -$47 stuck-positions
+      //    leak. Dedup is the responsibility of `leg.account.seen`.
       for (const leg of legs) {
         const trades = await fetchOurTrades(leg.tokenId, leg.sinceMs);
         for (const t of trades) {
           if (leg.account.seen.has(t.id)) continue;
           leg.account = applyTrade(leg.account, t);
-          if (t.tsMs > leg.sinceMs) leg.sinceMs = t.tsMs;
           logEvent({
             kind: 'fill',
             token: leg.tokenId,
@@ -680,6 +686,34 @@ async function main(): Promise<void> {
     if (halted) {
       marketFeed.setAssets([]);
       continue;
+    }
+
+    // FINAL SWEEP: pull fills one last time for each leg before computing
+    // legPnl. /activity has up to ~20s lag, so fills that filled in the last
+    // 30s of the window may not have been visible during the inner loop. With
+    // sinceMs frozen at window_open-60s and the seen-set dedup, this sweep
+    // is safe to call repeatedly and only adds what we missed.
+    for (const leg of legs) {
+      const lateTrades = await fetchOurTrades(leg.tokenId, leg.sinceMs);
+      let lateCount = 0;
+      for (const t of lateTrades) {
+        if (leg.account.seen.has(t.id)) continue;
+        leg.account = applyTrade(leg.account, t);
+        lateCount++;
+        logEvent({
+          kind: 'fill',
+          token: leg.tokenId,
+          leg: leg.label,
+          id: t.id,
+          side: t.side,
+          price: t.price,
+          shares: t.shares,
+          late: true,
+        });
+      }
+      if (lateCount > 0) {
+        logEvent({ kind: 'final_sweep', token: leg.tokenId, leg: leg.label, lateCount, sharesAfter: leg.account.shares });
+      }
     }
 
     // Settle the window per leg. YES settles to 1 if yesWon, NO settles to the

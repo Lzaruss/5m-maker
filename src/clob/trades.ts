@@ -29,15 +29,23 @@ export function deriveTradeId(r: any, tsMs: number): string {
 }
 
 /**
- * Fetch our executed trades for a token since `sinceMs`. Maps to accounting.Trade.
+ * Fetch our executed trades for a token. Maps to accounting.Trade.
  *
  * Uses `/activity` (NOT `/trades`) because the public `/trades` endpoint only
- * returns fills where the user was the TAKER. As a maker-only bot, every one of
- * our fills appears solely on `/activity` with `type:"TRADE"`. Hitting the
- * wrong endpoint silently returned [] for us and left the bot's internal
- * accounting permanently flat while real orders filled on chain — the root
- * cause of the 2026-05-26 19:23 UTC -$7.63 loss (no skew, no flatten, no halt).
+ * returns fills where the user was the TAKER. As a maker-only bot, every one
+ * of our fills appears solely on `/activity` with `type:"TRADE"`.
+ *
+ * `sinceMs` is a SOFT floor — we only return trades on or after this timestamp
+ * MINUS a generous slack (5 minutes by default). This is critical: /activity
+ * has variable polling lag, fills arrive out-of-order vs their event time,
+ * and previously we used a strict `tsMs > sinceMs` filter that silently
+ * dropped late-arriving fills. Combined with the per-window cursor reset,
+ * lost fills became open positions the bot never accounted for (the
+ * 2026-05-27 -$47 stuck-positions episode). Deduplication is now handled
+ * exclusively by the caller's `seen` set — that is the canonical mechanism.
  */
+const SINCE_SLACK_MS = 5 * 60_000;
+
 export async function fetchOurTrades(tokenId: string, sinceMs: number): Promise<Trade[]> {
   const user = loadEnv().clobFunderAddress;
   try {
@@ -47,13 +55,16 @@ export async function fetchOurTrades(tokenId: string, sinceMs: number): Promise<
     });
     const arr: any[] = Array.isArray(data) ? data : (data?.activity ?? data?.data ?? []);
     const out: Trade[] = [];
+    const floorMs = sinceMs - SINCE_SLACK_MS;
     for (const r of arr) {
-      // /activity returns TRADE, REDEEM, SPLIT, MERGE, ... — only TRADE is a fill.
       if (String(r.type ?? '').toUpperCase() !== 'TRADE') continue;
       const asset = String(r.asset ?? r.asset_id ?? r.tokenId ?? '');
       if (asset !== tokenId) continue;
       const tsMs = Number(r.timestamp ?? 0) > 1e12 ? Number(r.timestamp) : Number(r.timestamp ?? 0) * 1000;
-      if (tsMs <= sinceMs) continue;
+      // Floor instead of strict `<= sinceMs` — never drop a late fill while
+      // we're still potentially trading on this token. Dedup is handled by the
+      // caller's `account.seen` set.
+      if (tsMs < floorMs) continue;
       out.push({
         id: deriveTradeId(r, tsMs),
         side: String(r.side).toUpperCase() === 'SELL' ? 'SELL' : 'BUY',
