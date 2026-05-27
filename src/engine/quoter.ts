@@ -23,8 +23,11 @@ export type QuoteDecision =
   | { action: 'quote'; bid: QuoteSidePlan | null; ask: QuoteSidePlan | null; reason: string }
   | { action: 'no_quote'; reason: string };
 
-const PRICE_MIN = 0.01;
-const PRICE_MAX = 0.99;
+// Hard floor/ceiling enforced by Polymarket itself. The config-level
+// `quotePriceMin/Max` is the SOFTER strategy-level clip (typically 0.05–0.95)
+// to avoid "lottery-ticket" extreme-price quotes.
+const VENUE_PRICE_MIN = 0.01;
+const VENUE_PRICE_MAX = 0.99;
 
 /**
  * Pure market-making quote computation. No I/O. Combines:
@@ -106,9 +109,16 @@ function finalizeSide(
 ): QuoteSidePlan | null {
   if (price === null) return null;
   let p = roundToTick(price, cfg.tickSize, dir);
-  p = clamp(p, PRICE_MIN, PRICE_MAX);
-  if (!(p >= PRICE_MIN) || !(p <= PRICE_MAX)) return null;
-  const sizeShares = cfg.quoteSizeUsd / p;
+  p = clamp(p, VENUE_PRICE_MIN, VENUE_PRICE_MAX);
+  // Strategy-level price clip — refuse to quote outside [quotePriceMin,
+  // quotePriceMax]. Removes "lottery ticket" BUYs at sub-cent prices and
+  // SELLs near the resolved touch. Returning null cleanly suppresses the side.
+  if (p < cfg.quotePriceMin || p > cfg.quotePriceMax) return null;
+  // Polymarket rejects orders below the per-market min_order_size (typically 5
+  // shares). At extreme prices `quoteSizeUsd / p` falls below that floor, so
+  // clamp UP — accepting slightly higher notional in exchange for an order the
+  // venue will actually take.
+  const sizeShares = Math.max(cfg.quoteSizeUsd / p, cfg.minQuoteShares);
   return { price: p, sizeShares };
 }
 

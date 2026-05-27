@@ -11,6 +11,7 @@ import type { MakerConfig } from '../../src/util/config.js';
 const cfg: MakerConfig = {
   halfSpread: 0.03,
   quoteSizeUsd: 3.0,
+  minQuoteShares: 5.0,
   inventorySkewK: 0.5,
   widenFactor: 2.0,
   maxInventoryUsd: 15.0,
@@ -18,6 +19,12 @@ const cfg: MakerConfig = {
   adverseGuard: { btcReturn30sWiden: 0.0005, btcReturn30sPull: 0.001 },
   flattenBeforeSec: 20,
   flattenIfNetAboveUsd: 6.0,
+  disableSell: false,
+  quotePriceMin: 0.05,
+  quotePriceMax: 0.95,
+  maxUnmatchedShares: 5,
+  maxSpendPerLegUsd: 5,
+  replaceDeadbandTicks: 3,
   fillParticipation: 1.0,
   takerFeeRate: 0.07,
 };

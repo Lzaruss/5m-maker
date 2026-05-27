@@ -19,10 +19,12 @@
   "dependencies": {
     "@ethersproject/wallet": "^5.8.0",
     "@polymarket/clob-client-v2": "^1.0.6",
+    "@types/node-telegram-bot-api": "^0.64.14",
     "axios": "^1.6.0",
     "dotenv": "^16.3.1",
     "ethers": "^6.9.0",
     "js-yaml": "^4.1.0",
+    "node-telegram-bot-api": "^0.66.0",
     "pino": "^8.17.0",
     "ws": "^8.15.0"
   },

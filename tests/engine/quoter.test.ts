@@ -5,6 +5,7 @@ import type { MakerConfig } from '../../src/util/config.js';
 const cfg: MakerConfig = {
   halfSpread: 0.03,
   quoteSizeUsd: 3.0,
+  minQuoteShares: 5.0,
   inventorySkewK: 0.5,
   widenFactor: 2.0,
   maxInventoryUsd: 15.0,
@@ -12,6 +13,12 @@ const cfg: MakerConfig = {
   adverseGuard: { btcReturn30sWiden: 0.0005, btcReturn30sPull: 0.001 },
   flattenBeforeSec: 20,
   flattenIfNetAboveUsd: 6.0,
+  disableSell: false,
+  quotePriceMin: 0.05,
+  quotePriceMax: 0.95,
+  maxUnmatchedShares: 5,
+  maxSpendPerLegUsd: 5,
+  replaceDeadbandTicks: 3,
   fillParticipation: 1.0,
   takerFeeRate: 0.07,
 };
@@ -96,6 +103,25 @@ describe('computeQuotes', () => {
 
   it('drops the ask when inventory is at the short cap', () => {
     const d = computeQuotes({ ...base, inventoryShares: -40, inventoryUsd: -15 }, cfg);
+    if (d.action !== 'quote') throw new Error('expected quote');
+    expect(d.ask).toBeNull();
+    expect(d.bid).not.toBeNull();
+  });
+
+  it('clamps quote size UP to minQuoteShares at extreme prices', () => {
+    // With mid 0.70, both bid (0.67) and ask (0.73) yield naive size = 3/p <
+    // 5 shares. Both within the [0.05, 0.95] quote clip so they're not
+    // suppressed; size is clamped to minQuoteShares.
+    const d = computeQuotes({ ...base, bestBid: 0.69, bestAsk: 0.71 }, cfg);
+    if (d.action !== 'quote') throw new Error('expected quote');
+    expect(d.ask!.sizeShares).toBeGreaterThanOrEqual(cfg.minQuoteShares);
+    expect(d.bid!.sizeShares).toBeGreaterThanOrEqual(cfg.minQuoteShares);
+  });
+
+  it('refuses to quote outside the [quotePriceMin, quotePriceMax] band', () => {
+    // mid 0.97 -> ask ~1.00 (clipped to 0.99 by venue, then clipped by
+    // quotePriceMax 0.95 -> null). The bid (0.94) is allowed.
+    const d = computeQuotes({ ...base, bestBid: 0.96, bestAsk: 0.98 }, cfg);
     if (d.action !== 'quote') throw new Error('expected quote');
     expect(d.ask).toBeNull();
     expect(d.bid).not.toBeNull();

@@ -1,5 +1,5 @@
 /**
- * src/index.ts — LIVE market-making orchestrator (Task 9).
+ * src/index.ts — LIVE market-making orchestrator (dual-token: YES + NO).
  *
  * ============================ SAFETY OVERVIEW ============================
  * This is the ONLY file that places real orders with real money. Every real
@@ -8,12 +8,26 @@
  * runs the full decision loop and LOGS the intended place/cancel/flatten
  * actions via logEvent, but performs NO venue mutations — a safe dry preview.
  *
- * Layered guardrails (all implemented below):
+ * STRATEGY (two-sided market-making WITHOUT shorting):
+ *   For each 5m binary market we quote BUY on BOTH outcome tokens (YES + NO)
+ *   in parallel. Polymarket rejects SELL orders unless we own the underlying
+ *   token, so the canonical Polymarket maker design is "BUY both legs". If we
+ *   get filled on each leg, `1 YES + 1 NO = $1` at settlement regardless of
+ *   outcome — the combined spread we captured is risk-free profit. If only one
+ *   leg fills we carry that directional position to resolution.
+ *
+ *   SELL orders are still posted, BUT suppressed automatically when we don't
+ *   own enough shares to back them (avoids the venue's "insufficient balance"
+ *   rejection storm). This lets the bot capture spread on the way OUT once a
+ *   BUY has filled.
+ *
+ * Layered guardrails:
  *   1. enabled gate — no real order calls unless cfg.live.enabled === true.
  *   2. shutdown handler — SIGINT/SIGTERM/uncaughtException -> cancelAll (if
  *      enabled) -> closeLog -> exit, running exactly once.
  *   3. per-place deployed-capital check — recomputed immediately before each
  *      placeLimitMaker; the place is skipped if it would breach maxDeployedUsd.
+ *      Tracked GLOBALLY across both YES and NO legs.
  *   4. daily-loss halt — if realized+marked PnL for the UTC day reaches
  *      -dailyLossHaltUsd we cancel everything and stop quoting until 00:00 UTC.
  *   5. single asset (BTC), single window at a time.
@@ -23,7 +37,7 @@
  * ========================================================================
  */
 
-import { loadBotYaml, loadEnv, type BotConfig } from './util/config.js';
+import { loadBotYaml, loadEnv, assertLiveEnv, type BotConfig } from './util/config.js';
 import { logger } from './util/logger.js';
 import { getUsdcBalance } from './clob/client.js';
 import { fetchMarkets, fetchResolution, type ShortMarket } from './markets/gammaPoller.js';
@@ -39,9 +53,15 @@ import {
   cancelAll,
   listOpenOrders,
   marketFlatten,
+  isThrottled,
+  throttleRemainingMs,
 } from './clob/orders.js';
 import { fetchOurTrades } from './clob/trades.js';
 import { logEvent, closeLog } from './persistence/eventLog.js';
+import { createBot } from './telegram/bot.js';
+import { registerCommands } from './telegram/commands.js';
+import { Notifier } from './telegram/notifier.js';
+import { emptyState, type BotState } from './telegram/state.js';
 
 // --------------------------------------------------------------------------
 // Helpers
@@ -68,16 +88,26 @@ function openBuyNotional(open: LiveOrder[]): number {
   return sum;
 }
 
+interface TokenLeg {
+  tokenId: string;
+  label: 'YES' | 'NO';
+  account: Account;
+  sinceMs: number;
+  flattened: boolean;
+  /** Cumulative BUY notional successfully placed on this leg in the current
+   *  window. Used by the per-leg spend cap (`maxSpendPerLegUsd`) — once we
+   *  cross the cap, no more BUYs on this leg until the next window. Counts
+   *  ALL placed BUYs (including ones that ended up cancelled) which makes
+   *  the cap conservative but immune to /activity polling lag. */
+  buyNotionalCommitted: number;
+}
+
 // --------------------------------------------------------------------------
 // Shutdown — runs exactly once.
 // --------------------------------------------------------------------------
 
 let shuttingDown = false;
 
-/**
- * Graceful shutdown. SAFER: always attempt cancelAll when live, even if we are
- * not certain anything is resting, so we never leave orphaned orders behind.
- */
 async function shutdown(reason: string, enabled: boolean, code = 0): Promise<void> {
   if (shuttingDown) return;
   shuttingDown = true;
@@ -106,7 +136,8 @@ async function main(): Promise<void> {
   const env = loadEnv();
   const enabled = cfg.live.enabled === true;
 
-  // Install signal / crash handlers up front so an early failure still cleans up.
+  if (enabled) assertLiveEnv(env);
+
   process.on('SIGINT', () => void shutdown('SIGINT', enabled, 0));
   process.on('SIGTERM', () => void shutdown('SIGTERM', enabled, 0));
   process.on('uncaughtException', (err) => {
@@ -118,8 +149,6 @@ async function main(): Promise<void> {
     void shutdown('unhandledRejection', enabled, 1);
   });
 
-  // Read balance once at startup for the audit trail. SAFER: tolerate failure
-  // (e.g. read-only preview without creds) — log NaN rather than crashing.
   let balance = NaN;
   try {
     balance = await getUsdcBalance();
@@ -140,43 +169,90 @@ async function main(): Promise<void> {
     enabled ? 'LIVE TRADING ENABLED — real orders will be placed' : 'DRY PREVIEW — no real orders',
   );
 
-  // Single asset by design. SAFER: pin to BTC regardless of config breadth so a
-  // misconfigured assets list can never widen the blast radius.
+  // ------------------------------------------------------------------ Telegram
+  // Shared state lives here so commands can read/write it concurrently with the
+  // main loop. Bot creation is silent if creds are missing (createBot returns
+  // null) — Telegram is optional, not load-bearing for trading.
+  const state: BotState = emptyState();
+  state.enabled = enabled;
+  state.startBalanceUsd = balance;
+  const tgBot = createBot({ token: env.telegramBotToken, allowedChatId: env.telegramChatId });
+  const notifier = new Notifier(tgBot, env.telegramChatId);
+  if (tgBot) {
+    registerCommands({
+      bot: tgBot,
+      chatId: env.telegramChatId,
+      state,
+      cfg: {
+        dailyLossHaltUsd: cfg.live.dailyLossHaltUsd,
+        sessionLossHaltUsd: cfg.live.sessionLossHaltUsd,
+        maxDeployedUsd: cfg.live.maxDeployedUsd,
+      },
+      requestShutdown: (reason) => void shutdown(reason, enabled, 0),
+    });
+    logger.info('telegram bot online');
+    void notifier.start(balance, cfg.live.sessionLossHaltUsd, cfg.live.dailyLossHaltUsd);
+  }
+
   const ASSET = 'BTC' as const;
 
-  // Warm up the Binance price feed so the 30s return (adverse-selection guard)
-  // is populated before we quote.
+  // Warm up the Binance price feed BEFORE quoting — `getReturn(30)` needs ~24s
+  // of buffered ticks to return a non-null value.
   const priceFeed = new PriceFeed();
   priceFeed.start([ASSET]);
-  await sleep(3000);
+  const ready = await priceFeed.waitUntilReady([ASSET], 40_000);
+  if (!ready) {
+    logger.warn('priceFeed warm-up timed out — adverse-selection guard will activate once data arrives');
+  }
 
-  // Per-UTC-day realized PnL accounting and halt state.
+  // Per-UTC-day realized PnL accounting and halt state (shared across both legs).
   let today = utcDay();
   let realizedTodayUsd = 0;
+  // Cumulative realized P&L since process startup — survives the UTC-midnight
+  // reset that wipes `realizedTodayUsd`. Used by the HARD session-loss halt
+  // (overnight safety net: when crossed, bot exits and requires manual restart).
+  let realizedSessionUsd = 0;
   let halted = false;
   let haltUntilMs = 0;
 
-  // Latest order book for the current window, fed by the CLOB market feed.
-  // Held in a mutable object so the onBook closure write and the loop reads
-  // share one reference without TS control-flow narrowing it to `never`.
-  const bookHolder: { current: BookSnapshot | null } = { current: null };
+  // Per-token book holder. The market feed maintains its own per-asset book
+  // internally; we mirror the latest snapshot here keyed by tokenId so the loop
+  // can read either leg's touch in O(1). Reset between windows.
+  const books: Map<string, BookSnapshot> = new Map();
+  // Last-known mid per token. Used as fallback when the current book is empty
+  // or one-sided for a moment (it happens during violent moves) — without this
+  // fallback, `mid=0` would mark inventory at $0 and spuriously trip the
+  // daily-loss halt while we're actually holding valuable shares. Reset
+  // between windows along with `books`.
+  const lastMids: Map<string, number> = new Map();
   const marketFeed = new ClobMarketFeed({
     onBook: (snap) => {
-      bookHolder.current = snap;
+      books.set(snap.assetId, snap);
+      if (snap.bids.length > 0 && snap.asks.length > 0) {
+        const mid = (snap.bids[0].price + snap.asks[0].price) / 2;
+        if (mid > 0) lastMids.set(snap.assetId, mid);
+      }
     },
   });
-  // Typed accessor: returns the declared union so reads aren't narrowed to
-  // `never` by the `bookHolder.current = null` reset between windows.
-  const getBook = (): BookSnapshot | null => bookHolder.current;
+
+  // Rolling counters for the periodic `summary` event. Reset only on process
+  // restart — useful for overnight monitoring without grepping the full log.
+  const sessionStartMs = Date.now();
+  let lastSummaryMs = sessionStartMs;
+  let placeOkCount = 0;
+  let placeFailCount = 0;
+  let hedgeBlockCount = 0;
+  let spendBlockCount = 0;
+  let windowsCount = 0;
+  let winningWindows = 0;
+  let losingWindows = 0;
+  const SUMMARY_INTERVAL_MS = 5 * 60_000;
 
   // ------------------------------------------------------------------ outer loop
-  // One iteration per trading window. We only ever track a single window at a
-  // time (single asset, single window — guardrail #5).
   // eslint-disable-next-line no-constant-condition
   while (true) {
     if (shuttingDown) return;
 
-    // Roll the day over: reset realized PnL and clear any halt at UTC midnight.
     const nowDay = utcDay();
     if (nowDay !== today) {
       logEvent({ kind: 'day_rollover', from: today, to: nowDay, realizedClosedUsd: realizedTodayUsd });
@@ -186,18 +262,16 @@ async function main(): Promise<void> {
       haltUntilMs = 0;
     }
 
-    // If halted, idle until the next UTC midnight (or until the day rolls over).
     if (halted) {
       const waitMs = Math.max(1000, Math.min(60_000, haltUntilMs - Date.now()));
       if (Date.now() >= haltUntilMs) {
-        halted = false; // day boundary reached; loop top will reset accounting
+        halted = false;
         continue;
       }
       await sleep(waitMs);
       continue;
     }
 
-    // Discover the soonest-resolving BTC 5-minute window that hasn't resolved.
     const markets = await fetchMarkets([ASSET], 5);
     const now = Date.now();
     const market: ShortMarket | undefined = markets
@@ -209,202 +283,503 @@ async function main(): Promise<void> {
       continue;
     }
 
-    const token = market.yesTokenId;
     const resolvesAtMs = market.resolvesAt.getTime();
+    const legs: TokenLeg[] = [
+      { tokenId: market.yesTokenId, label: 'YES', account: emptyAccount(), sinceMs: Date.now(), flattened: false, buyNotionalCommitted: 0 },
+      { tokenId: market.noTokenId, label: 'NO', account: emptyAccount(), sinceMs: Date.now(), flattened: false, buyNotionalCommitted: 0 },
+    ];
+
     logEvent({
       kind: 'window_open',
-      token,
+      yesToken: market.yesTokenId,
+      noToken: market.noTokenId,
       question: market.question,
       resolvesAt: market.resolvesAt.toISOString(),
     });
-    logger.info({ token: token.slice(0, 10), resolvesAt: market.resolvesAt.toISOString() }, 'window open');
+    logger.info(
+      {
+        yesToken: market.yesTokenId.slice(0, 10),
+        noToken: market.noTokenId.slice(0, 10),
+        resolvesAt: market.resolvesAt.toISOString(),
+      },
+      'window open',
+    );
 
-    // Fresh per-window state.
-    let account: Account = emptyAccount();
-    let sinceMs = Date.now();
-    let flattened = false;
-    bookHolder.current = null;
-
-    // Subscribe the market feed to this window's YES token.
-    marketFeed.setAssets([token]);
+    // Reset per-window book + last-mid state and subscribe to BOTH outcome tokens.
+    for (const leg of legs) {
+      books.delete(leg.tokenId);
+      lastMids.delete(leg.tokenId);
+    }
+    marketFeed.setAssets(legs.map((l) => l.tokenId));
 
     // ------------------------------------------------------------ inner loop
-    // Quote/flatten cadence until 60s past resolution (gives fills time to land).
     while (Date.now() <= resolvesAtMs + 60_000) {
       if (shuttingDown) return;
       await sleep(cfg.live.pollIntervalMs);
 
-      // 1. Pull our executed trades and fold them into the account. Idempotent
-      //    on trade id; advance the cursor past the newest trade we have seen.
-      const trades = await fetchOurTrades(token, sinceMs);
-      for (const t of trades) {
-        if (account.seen.has(t.id)) continue;
-        account = applyTrade(account, t);
-        if (t.tsMs > sinceMs) sinceMs = t.tsMs;
-        logEvent({ kind: 'fill', token, id: t.id, side: t.side, price: t.price, shares: t.shares });
+      // Mirror live counters into the shared state so /status etc. are O(1).
+      state.realizedTodayUsd = realizedTodayUsd;
+      state.realizedSessionUsd = realizedSessionUsd;
+      state.windowsCount = windowsCount;
+      state.winningWindows = winningWindows;
+      state.losingWindows = losingWindows;
+      state.placeOkCount = placeOkCount;
+      state.placeFailCount = placeFailCount;
+      state.haltedDaily = halted;
+      state.haltUntilMs = haltUntilMs;
+
+      // Periodic summary so overnight sessions are scan-friendly without
+      // grepping per-window events. Includes everything needed at-a-glance:
+      // P&L (realized today + session), throughput, failure rate, and how
+      // often each cap is gating BUYs.
+      if (Date.now() - lastSummaryMs >= SUMMARY_INTERVAL_MS) {
+        const placeTotal = placeOkCount + placeFailCount;
+        const failRate = placeTotal > 0 ? placeFailCount / placeTotal : 0;
+        const uptimeMin = Math.round((Date.now() - sessionStartMs) / 60_000);
+        logEvent({
+          kind: 'summary',
+          uptimeMin,
+          realizedTodayUsd,
+          realizedSessionUsd,
+          windowsCount,
+          winningWindows,
+          losingWindows,
+          placeOkCount,
+          placeFailCount,
+          placeFailRatePct: Math.round(failRate * 100),
+          hedgeBlockCount,
+          spendBlockCount,
+          throttled: isThrottled(),
+        });
+        logger.info(
+          {
+            uptimeMin,
+            realizedSessionUsd: Number(realizedSessionUsd.toFixed(2)),
+            windowsCount,
+            winRate: windowsCount > 0 ? Math.round((100 * winningWindows) / windowsCount) : 0,
+            placeFailRatePct: Math.round(failRate * 100),
+          },
+          'summary',
+        );
+        lastSummaryMs = Date.now();
       }
 
-      // 2. Need a book to do anything.
-      const book = getBook();
-      if (!book || book.bids.length === 0 || book.asks.length === 0) continue;
-      const bestBid = book.bids[0].price;
-      const bestAsk = book.asks[0].price;
-      if (!(bestBid > 0) || !(bestAsk > 0)) continue;
+      // 1. Pull fills for each leg independently.
+      for (const leg of legs) {
+        const trades = await fetchOurTrades(leg.tokenId, leg.sinceMs);
+        for (const t of trades) {
+          if (leg.account.seen.has(t.id)) continue;
+          leg.account = applyTrade(leg.account, t);
+          if (t.tsMs > leg.sinceMs) leg.sinceMs = t.tsMs;
+          logEvent({
+            kind: 'fill',
+            token: leg.tokenId,
+            leg: leg.label,
+            id: t.id,
+            side: t.side,
+            price: t.price,
+            shares: t.shares,
+          });
+        }
+      }
 
-      const mid = (bestBid + bestAsk) / 2;
+      // 2. Compute marks and the global dayPnl. A leg with no usable book is
+      //    EXCLUDED from the mark — falling back to mid=0 there would value
+      //    real inventory at $0 and falsely trip the daily-loss halt during
+      //    transient empty-book moments (the violent-move scenario that bit
+      //    us on 2026-05-26 19:49 UTC).
+      const legMids: Record<string, number> = {};
+      let markPnl = 0;
+      let unmarkedLegs = 0;
+      for (const leg of legs) {
+        const book = books.get(leg.tokenId);
+        const bookMid =
+          book && book.bids.length && book.asks.length
+            ? (book.bids[0].price + book.asks[0].price) / 2
+            : 0;
+        const mid = bookMid > 0 ? bookMid : (lastMids.get(leg.tokenId) ?? 0);
+        legMids[leg.tokenId] = mid;
+        if (mid > 0) {
+          markPnl += pnl(leg.account, mid);
+        } else if (leg.account.shares !== 0) {
+          // We hold shares but have NO mark — be conservative for the gate but
+          // do not trip the halt on a noisy book moment.
+          unmarkedLegs++;
+        }
+      }
+      const dayPnl = realizedTodayUsd + markPnl;
+
       const tNow = Date.now();
       const timeToResolveSec = (resolvesAtMs - tNow) / 1000;
-      const inventoryUsd = account.shares * mid;
 
-      // 3. Daily-loss halt (guardrail #4). Mark the open window to current mid.
-      const dayPnl = realizedTodayUsd + pnl(account, mid);
-      if (dayPnl <= -cfg.live.dailyLossHaltUsd) {
-        logEvent({ kind: 'halt', token, dayPnl, dailyLossHaltUsd: cfg.live.dailyLossHaltUsd });
-        logger.error({ dayPnl }, 'DAILY LOSS HALT — cancelling everything and pausing until UTC midnight');
+      // 3. Daily-loss halt (guardrail #4). REALIZED-only: only locked-in P&L
+      //    from closed windows can trip the halt. Mark-to-mid mid-window is
+      //    advisory because in binary markets the mid is a probability while
+      //    the eventual settle is 0/1 — a "marked loser" hedged inventory can
+      //    redeem profitably (the 2026-05-26 20:09 UTC episode: marked -$3.54
+      //    but actually +$0.81 after NO redeemed). We do log a `mark_warn`
+      //    event so the operator sees mark stress without forcing a halt.
+      if (markPnl <= -cfg.live.dailyLossHaltUsd && unmarkedLegs === 0) {
+        logEvent({ kind: 'mark_warn', markPnl, threshold: -cfg.live.dailyLossHaltUsd, realizedTodayUsd });
+      }
+      if (realizedTodayUsd <= -cfg.live.dailyLossHaltUsd) {
+        logEvent({ kind: 'halt', realizedTodayUsd, dailyLossHaltUsd: cfg.live.dailyLossHaltUsd, dayPnl });
+        logger.error({ realizedTodayUsd, dayPnl }, 'DAILY LOSS HALT (realized) — cancelling, flattening, and pausing until UTC midnight');
+        void notifier.dailyHalt(realizedTodayUsd, cfg.live.dailyLossHaltUsd);
         if (enabled) await cancelAll();
+        for (const leg of legs) {
+          if (leg.account.shares === 0) continue;
+          const book = books.get(leg.tokenId);
+          if (!book || book.bids.length === 0 || book.asks.length === 0) continue;
+          const side: 'BUY' | 'SELL' = leg.account.shares > 0 ? 'SELL' : 'BUY';
+          const shares = Math.abs(leg.account.shares);
+          const refPrice = side === 'BUY' ? book.asks[0].price : book.bids[0].price;
+          logEvent({ kind: 'halt_flatten', token: leg.tokenId, leg: leg.label, side, shares, refPrice });
+          if (enabled) await marketFlatten(leg.tokenId, side, shares, refPrice);
+        }
         halted = true;
         haltUntilMs = nextUtcMidnightMs();
-        break; // leave inner loop; outer loop idles until the new UTC day
+        break;
       }
 
-      // 4. FLATTEN PHASE (guardrail: close out before resolution). Inside the
-      //    flatten window we never quote — only cancel resting orders and, if
-      //    inventory is meaningful, market-flatten it once.
+      // 4. FLATTEN PHASE — applies to BOTH legs. We always cancel resting
+      //    orders at the boundary (otherwise we'd get lifted on the converging
+      //    touch). Whether to ALSO market-flatten residual inventory depends
+      //    on the strategy mode: classic mode flattens; BUY-only / hold-to-
+      //    resolution mode (disable_sell) lets the residual ride to settlement.
       if (timeToResolveSec <= cfg.maker.flattenBeforeSec) {
-        const open = await listOpenOrders(token);
-        if (open.length > 0) {
-          logEvent({ kind: 'flatten_cancel', token, ids: open.map((o) => o.id) });
-          if (enabled) await cancelByIds(open.map((o) => o.id));
+        for (const leg of legs) {
+          const mid = legMids[leg.tokenId];
+          if (!(mid > 0)) continue;
+          const open = await listOpenOrders(leg.tokenId);
+          if (open.length > 0) {
+            logEvent({ kind: 'flatten_cancel', token: leg.tokenId, leg: leg.label, ids: open.map((o) => o.id) });
+            if (enabled) await cancelByIds(open.map((o) => o.id));
+          }
+          if (cfg.maker.disableSell) continue; // hold residual to resolution
+          const invUsd = leg.account.shares * mid;
+          if (Math.abs(invUsd) > cfg.maker.flattenIfNetAboveUsd && !leg.flattened) {
+            // `mid` may have come from lastMids while the CURRENT book is empty
+            // on the side we'd cross. Skip the flatten this tick if so — we'll
+            // retry next tick when the book recovers. SAFER than market-crossing
+            // with no real reference price.
+            const book = books.get(leg.tokenId);
+            const side: 'BUY' | 'SELL' = leg.account.shares > 0 ? 'SELL' : 'BUY';
+            const touchSide = side === 'BUY' ? book?.asks : book?.bids;
+            if (!touchSide || touchSide.length === 0) {
+              logEvent({
+                kind: 'flatten_skip', token: leg.tokenId, leg: leg.label, side, invUsd,
+                reason: 'no_touch_side',
+              });
+              continue;
+            }
+            const shares = Math.abs(leg.account.shares);
+            const refPrice = touchSide[0].price;
+            logEvent({
+              kind: 'flatten', token: leg.tokenId, leg: leg.label, side, shares, refPrice, invUsd,
+            });
+            logger.warn({ leg: leg.label, side, shares, refPrice, invUsd }, 'flattening residual inventory');
+            const ok = enabled ? await marketFlatten(leg.tokenId, side, shares, refPrice) : true;
+            if (ok) leg.flattened = true;
+          }
         }
-        if (Math.abs(inventoryUsd) > cfg.maker.flattenIfNetAboveUsd && !flattened) {
-          const side = account.shares > 0 ? 'SELL' : 'BUY';
-          const amount = Math.abs(account.shares);
-          logEvent({ kind: 'flatten', token, side, amount, inventoryUsd });
-          logger.warn({ side, amount, inventoryUsd }, 'flattening residual inventory');
-          if (enabled) await marketFlatten(token, side, amount);
-          flattened = true; // flatten at most once per window regardless of fills
-        }
-        continue; // no quoting in the flatten window
+        continue;
       }
 
-      // 5. QUOTE PHASE.
-      //    Deployed capital = resting BUY notional + |inventory| value. This is
-      //    the figure both the risk gate and the per-place check use.
-      const openNow = await listOpenOrders(token);
-      const deployed = openBuyNotional(openNow) + Math.abs(account.shares) * mid;
-
-      const gates = checkGates({
-        realizedPnlTodayUsd: dayPnl,
-        deployedUsd: deployed,
-        inventoryUsd,
-        maxDeployedUsd: cfg.live.maxDeployedUsd,
-        dailyLossHaltUsd: cfg.live.dailyLossHaltUsd,
-        maxInventoryUsd: cfg.maker.maxInventoryUsd,
-      });
-
-      const decision = computeQuotes(
-        {
-          bestBid,
-          bestAsk,
-          inventoryShares: account.shares,
-          inventoryUsd,
-          btcReturn30s: priceFeed.getReturn(ASSET, 30),
-          timeToResolveSec,
-        },
-        cfg.maker,
-      );
-
-      // Build the desired quote set, filtered by the risk gate. If the gate is
-      // halted or the quoter declines, desired is empty -> reconcile cancels all.
-      const desired: DesiredQuote[] = [];
-      if (!gates.halted && decision.action === 'quote') {
-        if (decision.bid && gates.allowBuy) {
-          desired.push({ side: 'BUY', price: decision.bid.price, size: decision.bid.sizeShares });
-        }
-        if (decision.ask && gates.allowSell) {
-          desired.push({ side: 'SELL', price: decision.ask.price, size: decision.ask.sizeShares });
-        }
+      // 5. QUOTE PHASE — per-leg compute desired, reconcile, place. Deployed
+      //    capital is summed ACROSS BOTH LEGS so the global cap is respected.
+      //
+      // If the venue circuit breaker tripped (transient 425/429/5xx storm),
+      // skip the entire quote phase for this tick. We don't cancel resting
+      // orders either — if the venue is broken, cancels will also fail and
+      // the bot would just hammer it. The next tick will re-check.
+      if (isThrottled()) {
+        logEvent({ kind: 'throttled_skip', remainingMs: throttleRemainingMs() });
+        continue;
+      }
+      // Manual pause from Telegram /pause — skip the entire quote phase. The
+      // flatten phase before close still runs so we don't carry residuals.
+      if (state.paused) continue;
+      const openByToken: Record<string, LiveOrder[]> = {};
+      let deployedTotal = 0;
+      for (const leg of legs) {
+        const open = await listOpenOrders(leg.tokenId);
+        openByToken[leg.tokenId] = open;
+        const mid = legMids[leg.tokenId];
+        deployedTotal += openBuyNotional(open) + Math.abs(leg.account.shares) * mid;
       }
 
-      // Reconcile against what is actually resting (no churn if already correct).
-      const open: LiveOrder[] = openNow;
-      const { toCancel, toPlace } = reconcile(open, desired, cfg.maker.tickSize);
-      logEvent({
-        kind: 'reconcile',
-        token,
-        reason: decision.reason,
-        gate: gates.reason,
-        toCancel,
-        toPlace,
-        deployed,
-        dayPnl,
-      });
+      // Quotes/places per leg. The per-place cap check tracks deployedSoFar
+      // across both legs (guardrail #3).
+      let deployedSoFar = deployedTotal;
+      const btcReturn30s = priceFeed.getReturn(ASSET, 30);
 
-      if (!enabled) continue; // DRY PREVIEW — logged intentions only, no mutations.
+      for (const leg of legs) {
+        const book = books.get(leg.tokenId);
+        if (!book || book.bids.length === 0 || book.asks.length === 0) continue;
+        const bestBid = book.bids[0].price;
+        const bestAsk = book.asks[0].price;
+        if (!(bestBid > 0) || !(bestAsk > 0)) continue;
+        const mid = legMids[leg.tokenId];
+        const inventoryUsd = leg.account.shares * mid;
 
-      // Cancel first so freed capital is available before we place.
-      await cancelByIds(toCancel);
+        // Effective inventory the BUY gate sees = realized inventory + any
+        // resting BUY notional on THIS leg. Without this, the gate only sees
+        // realized fills (lagged by ~15s via /activity polling) while the
+        // venue may already have additional BUYs that could fill imminently.
+        // Including pending BUYs prevents stacking another order on top of
+        // one that hasn't filled yet — the 2026-05-26 19:49 UTC over-fill
+        // scenario (31 NO shares vs $3 cap).
+        const pendingBuyUsd = openBuyNotional(openByToken[leg.tokenId]);
+        const effectiveLongUsd = inventoryUsd + pendingBuyUsd;
 
-      // Per-place deployed-capital recheck (guardrail #3). We track deployed as
-      // we go so a batch of places can't collectively breach the cap.
-      let deployedSoFar = deployed;
-      for (const p of toPlace) {
-        const add = p.price * p.size;
-        if (deployedSoFar + add > cfg.live.maxDeployedUsd) {
-          logEvent({ kind: 'place_skipped', token, reason: 'max_deployed', side: p.side, price: p.price, size: p.size, deployedSoFar });
-          continue; // SAFER: skip rather than shrink — never exceed the cap
+        const gates = checkGates({
+          realizedPnlTodayUsd: dayPnl,
+          deployedUsd: deployedTotal,
+          inventoryUsd: effectiveLongUsd,
+          maxDeployedUsd: cfg.live.maxDeployedUsd,
+          dailyLossHaltUsd: cfg.live.dailyLossHaltUsd,
+          maxInventoryUsd: cfg.maker.maxInventoryUsd,
+        });
+
+        const decision = computeQuotes(
+          {
+            bestBid,
+            bestAsk,
+            inventoryShares: leg.account.shares,
+            inventoryUsd,
+            btcReturn30s,
+            timeToResolveSec,
+          },
+          cfg.maker,
+        );
+
+        // Hedge cap: don't add to the over-represented leg. `sharesDiff > 0`
+        // means THIS leg has more inventory than the other. Once that exceeds
+        // `maxUnmatchedShares`, BUY is suppressed on this leg until the other
+        // catches up — forces matched-pair accumulation. Bounds worst-case
+        // single-window directional exposure to ~maxUnmatchedShares * $1.
+        const otherLeg = legs.find((l) => l.tokenId !== leg.tokenId);
+        const sharesDiff = leg.account.shares - (otherLeg?.account.shares ?? 0);
+        const hedgeBlocksBuy = sharesDiff >= cfg.maker.maxUnmatchedShares;
+
+        // Per-leg per-window spend cap (immune to /activity polling lag).
+        const spendBlocksBuy =
+          leg.buyNotionalCommitted >= cfg.maker.maxSpendPerLegUsd;
+
+        const desired: DesiredQuote[] = [];
+        if (!gates.halted && decision.action === 'quote') {
+          // Pre-flight cross check: we use postOnly on every order. A quote
+          // that would CROSS the current touch (BUY at/above bestAsk, SELL
+          // at/below bestBid) is rejected by the venue with no benefit. Filter
+          // here so we don't burn an API call and (importantly) don't accumulate
+          // toward the venue rate-limit. Common when a fresh mid arrives
+          // between our last book read and the cancel/replace tick.
+          if (
+            decision.bid &&
+            gates.allowBuy &&
+            !hedgeBlocksBuy &&
+            !spendBlocksBuy &&
+            decision.bid.price < bestAsk
+          ) {
+            desired.push({ side: 'BUY', price: decision.bid.price, size: decision.bid.sizeShares });
+          }
+          // SELL handling:
+          //  - disable_sell: never post SELL (BUY-only / hold-to-resolution).
+          //  - Suppressed when shares < ask.size — naked SELL is rejected
+          //    by the venue with "insufficient balance".
+          //  - Suppressed when ask.price <= bestBid — postOnly would reject
+          //    (this was 99% of the place_fail count in canary-7).
+          if (
+            !cfg.maker.disableSell &&
+            decision.ask &&
+            gates.allowSell &&
+            leg.account.shares >= decision.ask.sizeShares &&
+            decision.ask.price > bestBid
+          ) {
+            desired.push({ side: 'SELL', price: decision.ask.price, size: decision.ask.sizeShares });
+          }
         }
-        const placed = await placeLimitMaker(token, p.side, p.price, p.size);
-        logEvent({ kind: 'place', token, side: p.side, price: p.price, size: p.size, ok: !!placed, orderId: placed?.orderId ?? null });
-        if (placed) deployedSoFar += add; // only count capital that actually rested
+
+        if (hedgeBlocksBuy) hedgeBlockCount++;
+        if (spendBlocksBuy) spendBlockCount++;
+        const { toCancel, toPlace } = reconcile(
+          openByToken[leg.tokenId],
+          desired,
+          cfg.maker.tickSize,
+          cfg.maker.tickSize * cfg.maker.replaceDeadbandTicks,
+        );
+        logEvent({
+          kind: 'reconcile',
+          token: leg.tokenId,
+          leg: leg.label,
+          reason: decision.reason,
+          gate: gates.reason,
+          hedgeBlocksBuy,
+          spendBlocksBuy,
+          spent: leg.buyNotionalCommitted,
+          toCancel,
+          toPlace,
+          deployedTotal,
+          dayPnl,
+          invShares: leg.account.shares,
+          sharesDiff,
+        });
+
+        if (!enabled) continue;
+
+        await cancelByIds(toCancel);
+
+        for (const p of toPlace) {
+          // Only BUY orders ADD to deployed exposure (USDC committed to a
+          // potential fill). SELL orders REDUCE exposure — they liquidate
+          // inventory we already hold, which is already counted in `deployed`
+          // via |inventory|*mid. Treating SELLs the same way previously caused
+          // valid liquidations to be skipped during volatile windows, leaving
+          // stale SELL prices on the book that got picked off at fire-sale
+          // (the 2026-05-26 20:08 UTC YES SELL @ 0.19 after buying at 0.26-0.41).
+          const add = p.side === 'BUY' ? p.price * p.size : 0;
+          if (add > 0 && deployedSoFar + add > cfg.live.maxDeployedUsd) {
+            logEvent({
+              kind: 'place_skipped',
+              token: leg.tokenId,
+              leg: leg.label,
+              reason: 'max_deployed',
+              side: p.side,
+              price: p.price,
+              size: p.size,
+              deployedSoFar,
+            });
+            continue;
+          }
+          const placed = await placeLimitMaker(leg.tokenId, p.side, p.price, p.size);
+          logEvent({
+            kind: 'place',
+            token: leg.tokenId,
+            leg: leg.label,
+            side: p.side,
+            price: p.price,
+            size: p.size,
+            ok: !!placed,
+            orderId: placed?.orderId ?? null,
+          });
+          if (placed) {
+            placeOkCount++;
+            deployedSoFar += add;
+            // Track every BUY placement against the per-leg spend cap. Once
+            // exceeded, no more BUYs on this leg this window.
+            if (p.side === 'BUY') leg.buyNotionalCommitted += p.price * p.size;
+          } else {
+            placeFailCount++;
+          }
+        }
       }
     }
     // ---------------------------------------------------------- end inner loop
 
-    // If we halted, skip settlement bookkeeping for this window — the outer loop
-    // will idle until the next UTC day.
     if (halted) {
       marketFeed.setAssets([]);
       continue;
     }
 
-    // Settle the window: prefer the on-chain resolution; fall back to last mid.
-    const res = await fetchResolution(token);
-    const finalBook = getBook();
-    const fallbackMid =
-      finalBook && finalBook.bids.length && finalBook.asks.length
-        ? (finalBook.bids[0].price + finalBook.asks[0].price) / 2
-        : 0.5;
-    const settle = res ? (res.yesWon ? 1 : 0) : fallbackMid;
-    const windowPnl = pnl(account, settle);
+    // Settle the window per leg. YES settles to 1 if yesWon, NO settles to the
+    // complement; fall back to last mid if the resolution isn't decisive yet.
+    const res = await fetchResolution(market.yesTokenId);
+    let windowPnl = 0;
+    for (const leg of legs) {
+      const fallback = legMidFromBook(books.get(leg.tokenId));
+      let settle: number;
+      if (res) {
+        const yesWon = res.yesWon;
+        settle = leg.label === 'YES' ? (yesWon ? 1 : 0) : (yesWon ? 0 : 1);
+      } else {
+        settle = fallback;
+      }
+      const legPnl = pnl(leg.account, settle);
+      windowPnl += legPnl;
+      logEvent({
+        kind: 'window_leg_result',
+        token: leg.tokenId,
+        leg: leg.label,
+        legPnl,
+        shares: leg.account.shares,
+        settle,
+        resolved: !!res,
+      });
+    }
     realizedTodayUsd += windowPnl;
+    realizedSessionUsd += windowPnl;
+    windowsCount++;
+    if (windowPnl > 0) winningWindows++;
+    else if (windowPnl < 0) losingWindows++;
 
     logEvent({
       kind: 'window_result',
-      token,
+      yesToken: market.yesTokenId,
+      noToken: market.noTokenId,
       windowPnl,
       realizedTodayUsd,
-      shares: account.shares,
-      settle,
+      realizedSessionUsd,
       resolved: !!res,
+      yesWon: res ? res.yesWon : null,
     });
-    logger.info({ token: token.slice(0, 10), windowPnl, realizedTodayUsd, settle }, 'window result');
+    logger.info({ windowPnl, realizedTodayUsd, realizedSessionUsd, resolved: !!res }, 'window result');
+    state.lastWindow = {
+      ts: Date.now(),
+      yesToken: market.yesTokenId,
+      noToken: market.noTokenId,
+      windowPnl,
+      yesWon: res ? res.yesWon : null,
+    };
+    // Push notable windows to Telegram (skip the noise of zero-PnL windows).
+    if (Math.abs(windowPnl) >= 0.01) {
+      void notifier.windowResult(windowPnl, realizedTodayUsd, res ? res.yesWon : null);
+    }
 
-    // Unsubscribe the feed before moving to the next window.
     marketFeed.setAssets([]);
+
+    // HARD session-loss check after every window settlement. Unlike the daily
+    // halt which idles until UTC midnight, this one EXITS the process — the
+    // overnight kill-switch. Operator must restart manually after reviewing.
+    if (realizedSessionUsd <= -cfg.live.sessionLossHaltUsd) {
+      logEvent({
+        kind: 'session_halt',
+        realizedSessionUsd,
+        realizedTodayUsd,
+        sessionLossHaltUsd: cfg.live.sessionLossHaltUsd,
+      });
+      logger.error(
+        { realizedSessionUsd, sessionLossHaltUsd: cfg.live.sessionLossHaltUsd },
+        'SESSION LOSS HALT — exiting process; restart manually after reviewing balance',
+      );
+      state.haltedSession = true;
+      // Best-effort Telegram alert; do not block shutdown waiting for the
+      // network — the send is fire-and-forget (Notifier swallows errors).
+      try {
+        await notifier.sessionHalt(realizedSessionUsd, cfg.live.sessionLossHaltUsd);
+      } catch {
+        /* ignore — shutdown is more important than the notification */
+      }
+      // shutdown() runs cancelAll (if enabled), closes the log, and exits.
+      await shutdown('session_loss_halt', enabled, 0);
+      return; // unreachable, but TS-clean
+    }
   }
-  // -------------------------------------------------------------- end outer loop
+}
+
+function legMidFromBook(book: BookSnapshot | undefined): number {
+  if (!book || book.bids.length === 0 || book.asks.length === 0) return 0.5;
+  return (book.bids[0].price + book.asks[0].price) / 2;
 }
 
 main().catch(async (err: any) => {
   logger.error({ err: err.message, stack: err.stack }, 'fatal error in main');
   logEvent({ kind: 'fatal', err: err.message });
-  // We don't know enabled here for certain; re-derive defensively and cancel.
   let enabled = false;
   try {
     enabled = loadBotYaml().live.enabled === true;
   } catch {
-    /* ignore — fall back to no real calls */
+    /* ignore */
   }
   await shutdown('fatal', enabled, 1);
 });
