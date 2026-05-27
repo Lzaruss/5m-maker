@@ -22,6 +22,7 @@ const cfg: MakerConfig = {
   disableSell: false,
   quotePriceMin: 0.05,
   quotePriceMax: 0.95,
+  maxBuyPrice: 0.50,
   maxUnmatchedShares: 5,
   maxSpendPerLegUsd: 5,
   replaceDeadbandTicks: 3,

@@ -33,6 +33,13 @@ export interface MakerConfig {
    *  symmetric SELLs near 0.99 where the market is essentially resolved. */
   quotePriceMin: number;
   quotePriceMax: number;
+  /** Refuse to post a BUY at a price > this. Buying the high-priced side of
+   *  a binary outcome is a TERRIBLE risk/reward unless you have directional
+   *  edge — a maker doesn't. At p=0.65, a winning trade gains $0.35/share
+   *  while a losing trade loses $0.65/share (R/R 0.54:1, needs 65% win rate
+   *  to break even). Restricting BUYs to the "underdog" side of the book
+   *  (typically <0.5) keeps every entry's R/R >= 1:1. Set to 1.0 to disable. */
+  maxBuyPrice: number;
   /** Maximum |sharesYES - sharesNO| before we stop posting BUY on the
    *  over-represented leg. Forces matched-pair accumulation — the matched
    *  portion settles to cost at resolution, the unmatched portion is the
@@ -113,6 +120,7 @@ export function parseBotYaml(raw: string): BotConfig {
     disableSell: m.disable_sell === true,
     quotePriceMin: m.quote_price_min ?? 0.05,
     quotePriceMax: m.quote_price_max ?? 0.95,
+    maxBuyPrice: m.max_buy_price ?? 0.50,
     maxUnmatchedShares: m.max_unmatched_shares ?? 5,
     maxSpendPerLegUsd: m.max_spend_per_leg_usd ?? 5,
     replaceDeadbandTicks: m.replace_deadband_ticks ?? 3,

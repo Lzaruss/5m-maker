@@ -5,12 +5,16 @@
 assets: [BTC, ETH, SOL, XRP, BNB, DOGE]
 
 maker:
-  half_spread: 0.03            # distance from mid per side (in price units)
-  quote_size_usd: 2.0          # notional per quoted side (effective min = 5*p with min_quote_shares=5)
+  # === Tightening config (2026-05-27) ===
+  # Goal: improve fill quality (reduce adverse-selection cost) at the price
+  # of fewer fills. The 50-55% win rate we saw bleeds in this regime; aiming
+  # for fewer-but-better entries to push win rate >60%.
+  half_spread: 0.05            # ↑ from 0.03 — quote deeper, better avg entry, fewer adverse fills
+  quote_size_usd: 2.0          # unchanged
   min_quote_shares: 5.0        # Polymarket min_order_size floor
-  inventory_skew_k: 0.4        # bid/ask skew strength when inventory is non-zero
+  inventory_skew_k: 0.2        # ↓ from 0.4 — less aggressive ask drop when long (prevents fire-sale SELLs)
   widen_factor: 2.5            # widen on volatility
-  max_inventory_usd: 2.0       # VALIDATION MODE: tighter while we verify the fetchOurTrades fix
+  max_inventory_usd: 2.0       # VALIDATION MODE
   tick_size: 0.01              # price granularity for rounding quotes
 
   # ── Strategy mode ─────────────────────────────────────────────────────────
@@ -22,13 +26,21 @@ maker:
   # ── Control knobs ────────────────────────────────────────────────────────
   quote_price_min: 0.05        # refuse to quote below this price (no lottery-ticket BUYs)
   quote_price_max: 0.95        # refuse to quote above this price (no extreme SELLs)
+  # === STRUCTURAL EDGE FIX (2026-05-27) ===
+  # Empirical analysis: 64% of overnight losses came from BUYs at price > 0.5.
+  # At p=0.65, R/R is 0.54:1 (needs 65% win rate; we have no directional info).
+  # Restricting BUYs to the "underdog" side (price <= 0.5) keeps R/R >= 1:1
+  # on every entry. Asymmetric — does NOT affect SELL placement.
+  max_buy_price: 0.50          # never post BUY above this price
   max_unmatched_shares: 4      # VALIDATION MODE: tighter hedge cap
   max_spend_per_leg_usd: 3     # VALIDATION MODE: smaller per-window exposure per leg
-  replace_deadband_ticks: 3    # only cancel+replace if desired moved >= this many ticks (reduces cancel-fill race)
+  replace_deadband_ticks: 3    # only cancel+replace if desired moved >= this many ticks
 
   adverse_guard:
-    btc_return_30s_widen: 0.0003
-    btc_return_30s_pull: 0.0007
+    # Tighter thresholds — pull the vulnerable side sooner during BTC moves.
+    # Informed flow is faster than our 1.5s poll cycle; we need to react earlier.
+    btc_return_30s_widen: 0.0002  # ↓ from 0.0003 — widen at smaller moves (0.02% in 30s)
+    btc_return_30s_pull: 0.0004   # ↓ from 0.0007 — pull side at 0.04% move (was 0.07%)
 
   flatten_before_sec: 30       # boundary where we cancel resting BUYs and (unless disable_sell) market-flatten residual
   flatten_if_net_above_usd: 1.0  # threshold for flatten when natural flatten phase runs

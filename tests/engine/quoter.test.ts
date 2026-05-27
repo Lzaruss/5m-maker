@@ -16,6 +16,7 @@ const cfg: MakerConfig = {
   disableSell: false,
   quotePriceMin: 0.05,
   quotePriceMax: 0.95,
+  maxBuyPrice: 0.50,
   maxUnmatchedShares: 5,
   maxSpendPerLegUsd: 5,
   replaceDeadbandTicks: 3,
@@ -109,22 +110,32 @@ describe('computeQuotes', () => {
   });
 
   it('clamps quote size UP to minQuoteShares at extreme prices', () => {
-    // With mid 0.70, both bid (0.67) and ask (0.73) yield naive size = 3/p <
-    // 5 shares. Both within the [0.05, 0.95] quote clip so they're not
-    // suppressed; size is clamped to minQuoteShares.
-    const d = computeQuotes({ ...base, bestBid: 0.69, bestAsk: 0.71 }, cfg);
+    // Override maxBuyPrice for this test — the default 0.50 would suppress
+    // the bid at mid 0.70. We're testing the min-size clamp specifically.
+    const cfgNoMaxBuy = { ...cfg, maxBuyPrice: 1.0 };
+    const d = computeQuotes({ ...base, bestBid: 0.69, bestAsk: 0.71 }, cfgNoMaxBuy);
     if (d.action !== 'quote') throw new Error('expected quote');
     expect(d.ask!.sizeShares).toBeGreaterThanOrEqual(cfg.minQuoteShares);
     expect(d.bid!.sizeShares).toBeGreaterThanOrEqual(cfg.minQuoteShares);
   });
 
   it('refuses to quote outside the [quotePriceMin, quotePriceMax] band', () => {
-    // mid 0.97 -> ask ~1.00 (clipped to 0.99 by venue, then clipped by
-    // quotePriceMax 0.95 -> null). The bid (0.94) is allowed.
-    const d = computeQuotes({ ...base, bestBid: 0.96, bestAsk: 0.98 }, cfg);
+    // Same: disable maxBuyPrice to isolate the [min, max] band behavior.
+    const cfgNoMaxBuy = { ...cfg, maxBuyPrice: 1.0 };
+    const d = computeQuotes({ ...base, bestBid: 0.96, bestAsk: 0.98 }, cfgNoMaxBuy);
     if (d.action !== 'quote') throw new Error('expected quote');
     expect(d.ask).toBeNull();
     expect(d.bid).not.toBeNull();
+  });
+
+  it('suppresses BUY when computed bid > maxBuyPrice (asymmetric underdog filter)', () => {
+    // mid 0.70 → bid would be 0.67 (R/R 0.49:1 — terrible). Filter kills it.
+    // The ASK side stays unaffected — selling at 0.73 is still fine.
+    const d = computeQuotes({ ...base, bestBid: 0.69, bestAsk: 0.71 }, cfg);
+    if (d.action !== 'quote') throw new Error('expected quote');
+    expect(d.bid).toBeNull();
+    expect(d.ask).not.toBeNull();
+    expect(d.reason).toBe('buy_above_max_price');
   });
 
   it('rounds bid down and ask up to the tick grid', () => {

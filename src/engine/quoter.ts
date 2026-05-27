@@ -84,22 +84,31 @@ export function computeQuotes(input: QuoteInput, cfg: MakerConfig): QuoteDecisio
   const bid = finalizeSide(bidPrice, cfg, 'down');
   const ask = finalizeSide(askPrice, cfg, 'up');
 
+  // Asymmetric "underdog-only BUY" filter. Buying the high-priced side of a
+  // binary market has R/R < 1 — a maker has no directional edge, so this
+  // systematically bleeds. Empirically (2026-05-27 -$23 stuck-positions
+  // analysis): 64% of losses came from BUYs at price > 0.5. The ASK side
+  // is unaffected — selling inventory at any price reduces risk.
+  const finalBid = bid && bid.price <= cfg.maxBuyPrice ? bid : null;
+
   // If rounding crossed the quotes, drop both (book too tight for our spread).
-  if (bid && ask && bid.price >= ask.price) {
+  if (finalBid && ask && finalBid.price >= ask.price) {
     return { action: 'no_quote', reason: 'crossed_after_rounding' };
   }
-  if (!bid && !ask) {
+  if (!finalBid && !ask) {
     return { action: 'no_quote', reason: 'both_sides_pulled' };
   }
 
   const reason =
-    absR >= cfg.adverseGuard.btcReturn30sPull
-      ? 'pulled_one_side'
-      : absR >= cfg.adverseGuard.btcReturn30sWiden
-        ? 'widened'
-        : 'normal';
+    bid && !finalBid
+      ? 'buy_above_max_price'
+      : absR >= cfg.adverseGuard.btcReturn30sPull
+        ? 'pulled_one_side'
+        : absR >= cfg.adverseGuard.btcReturn30sWiden
+          ? 'widened'
+          : 'normal';
 
-  return { action: 'quote', bid, ask, reason };
+  return { action: 'quote', bid: finalBid, ask, reason };
 }
 
 function finalizeSide(
