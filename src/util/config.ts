@@ -86,6 +86,19 @@ export interface LiveConfig {
   /** Seconds between on-chain position reconciliation checks (drift detection
    *  against the venue's true holdings). 0 disables the periodic check. */
   reconcileEverySec: number;
+  /** Stop opening NEW BUYs when liquid USDC falls below this floor. SELLs and
+   *  flatten stay enabled so the bot can still raise cash and reduce position.
+   *  Protects against the failure mode where the bot drains all cash into
+   *  tokens (winning ones unredeemed, losing ones worthless) and is left unable
+   *  to operate. 0 disables the gate. */
+  cashFloorUsd: number;
+  /** HARD halt on REAL on-chain net-worth drawdown from the start balance:
+   *  (cash + market value of held tokens) - startBalance <= -this => cancel +
+   *  exit. Unlike the mark-based daily/session halts (which trust the internal
+   *  share tracker), this reads the wallet directly via getAccountValue, so it
+   *  fires even if the internal accounting over-counts. Catastrophe backstop —
+   *  set WIDER than session_loss_halt. 0 disables. */
+  netWorthHaltUsd: number;
   /** When true, a detected drift snaps tracked shares to the on-chain truth
    *  (and adjusts cash at cost basis). When false, drift is only LOGGED — useful
    *  for observe-only validation before trusting the correction. */
@@ -161,6 +174,8 @@ export function parseBotYaml(raw: string): BotConfig {
     pollIntervalMs: lv.poll_interval_ms ?? 1500,
     reconcileEverySec: lv.reconcile_every_sec ?? 30,
     reconcileCorrect: lv.reconcile_correct ?? true,
+    cashFloorUsd: lv.cash_floor_usd ?? 0,
+    netWorthHaltUsd: lv.net_worth_halt_usd ?? 0,
   };
   return { assets, maker, risk, live };
 }

@@ -9,6 +9,8 @@ const base: RiskState = {
   maxDeployedUsd: 50,
   dailyLossHaltUsd: 20,
   maxInventoryUsd: 15,
+  cashUsd: 100,
+  cashFloorUsd: 0,
 };
 
 describe('checkGates', () => {
@@ -42,6 +44,25 @@ describe('checkGates', () => {
   it('blocks sells when short inventory at cap, still allows buys', () => {
     const g = checkGates({ ...base, inventoryUsd: -15 });
     expect(g.allowSell).toBe(false);
+    expect(g.allowBuy).toBe(true);
+  });
+
+  it('suppresses BUY but keeps SELL when cash is below the floor', () => {
+    const g = checkGates({ ...base, cashUsd: 12, cashFloorUsd: 20 });
+    expect(g.halted).toBe(false);
+    expect(g.allowBuy).toBe(false);
+    expect(g.allowSell).toBe(true);
+    expect(g.reason).toBe('cash_floor');
+  });
+
+  it('ignores the cash floor when cash is unknown (NaN balance read)', () => {
+    const g = checkGates({ ...base, cashUsd: NaN, cashFloorUsd: 20 });
+    expect(g.allowBuy).toBe(true);
+    expect(g.reason).toBe('ok');
+  });
+
+  it('cash floor of 0 disables the gate', () => {
+    const g = checkGates({ ...base, cashUsd: 0, cashFloorUsd: 0 });
     expect(g.allowBuy).toBe(true);
   });
 });

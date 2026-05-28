@@ -1,5 +1,6 @@
 import axios from 'axios';
 import { loadEnv } from '../util/config.js';
+import { getUsdcBalance } from './client.js';
 
 export interface ClobPosition {
   tokenId: string;
@@ -54,6 +55,51 @@ export async function getOpenPositions(): Promise<ClobPosition[]> {
 export async function findPosition(tokenId: string): Promise<ClobPosition | null> {
   const positions = await getOpenPositions();
   return positions.find((p) => p.tokenId === tokenId) ?? null;
+}
+
+export interface AccountValue {
+  /** Liquid USDC in the wallet. */
+  cashUsd: number;
+  /** Market value of ALL open token positions (winning + still-open). */
+  positionValueUsd: number;
+  /** Subset of positionValueUsd that is claimable NOW (resolved winners not
+   *  yet redeemed). This capital is "stuck" until redeem() is called. */
+  redeemableUsd: number;
+  /** cashUsd + positionValueUsd — the honest mark-to-market net worth. */
+  netWorthUsd: number;
+  openCount: number;
+  redeemableCount: number;
+  positions: ClobPosition[];
+}
+
+/**
+ * The single source of truth for "how are we actually doing". Combines the
+ * liquid USDC balance with the market value of held tokens. This is what the
+ * operator should compare against the bot's INTERNAL mark P&L (`realizedTodayUsd`)
+ * — a large gap means profit is locked in unredeemed tokens (or the internal
+ * tracker over-counted shares the reconciler later corrected).
+ */
+export async function getAccountValue(): Promise<AccountValue> {
+  const [positions, cashUsd] = await Promise.all([getOpenPositions(), getUsdcBalance()]);
+  let positionValueUsd = 0;
+  let redeemableUsd = 0;
+  let redeemableCount = 0;
+  for (const p of positions) {
+    positionValueUsd += p.currentValue;
+    if (p.redeemable) {
+      redeemableUsd += p.currentValue;
+      redeemableCount++;
+    }
+  }
+  return {
+    cashUsd,
+    positionValueUsd,
+    redeemableUsd,
+    netWorthUsd: cashUsd + positionValueUsd,
+    openCount: positions.length,
+    redeemableCount,
+    positions,
+  };
 }
 
 export interface RedeemEvent {

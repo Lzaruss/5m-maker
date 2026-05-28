@@ -1,0 +1,171 @@
+# =============================================================================
+# 5m-maker — example / reference configuration
+#
+# Copy this file to bot.yml and adjust values before running.
+# Run `npm run simulate` against recorded tapes to validate changes before
+# going live. Every parameter is explained below.
+# =============================================================================
+
+# Assets the SIMULATOR considers when scanning for markets.
+# Does NOT affect which assets run in live mode (see live.assets below).
+assets: [BTC, ETH, SOL, XRP, BNB]
+
+# -----------------------------------------------------------------------------
+# maker — quoting engine
+# -----------------------------------------------------------------------------
+maker:
+
+  # Distance from mid-price to each side of the quote.
+  # If mid = 0.50 → BUY posted at 0.46, SELL posted at 0.54 (with half_spread 0.04).
+  # Higher = more profit per fill, fewer fills.
+  # Lower  = more fills, smaller edge per fill, higher adverse-selection risk.
+  half_spread: 0.04
+
+  # Notional size of every order in USD.
+  # Actual shares = max(quote_size_usd / price, min_quote_shares).
+  # Controls how much capital is committed per order on each leg.
+  quote_size_usd: 2.0
+
+  # Minimum order size in shares. Polymarket rejects orders below ~5 shares.
+  # Kicks in at extreme prices where quote_size_usd / price would fall below floor.
+  min_quote_shares: 5.0
+
+  # Inventory-skew aggressiveness. When we hold more shares on one leg,
+  # the bot shades its prices to encourage selling that leg and buying the other.
+  # 0 = no skew (symmetric quotes always).
+  # Higher = stronger skew, faster mean-reversion of inventory, tighter spreads
+  #          on the over-represented leg (may give away edge under low volatility).
+  inventory_skew_k: 0.2
+
+  # Spread multiplier applied when price volatility exceeds btc_return_30s_widen.
+  # Effective half_spread = half_spread * widen_factor during volatile periods.
+  # Protects against adverse selection when the underlying is moving fast.
+  widen_factor: 2.5
+
+  # Maximum net inventory per leg in USD (shares × mid).
+  # Once a leg's inventory value exceeds this, BUYs on that leg are suppressed
+  # until inventory decays (via SELL fills or resolution).
+  max_inventory_usd: 2.5
+
+  # Price granularity. All quoted prices are rounded to the nearest tick.
+  # Polymarket uses 0.01 (1 cent).
+  tick_size: 0.01
+
+  # Set to true to suppress ALL SELL orders. The bot becomes BUY-only and
+  # holds every position to resolution (lottery mode, not market-making).
+  # Recommended: false. Only useful for debugging fill accounting.
+  disable_sell: false
+
+  # Refuse to quote (BUY or SELL) on tokens below this price.
+  # Prevents stacking lottery-ticket BUYs on near-zero tokens.
+  quote_price_min: 0.05
+
+  # Refuse to quote (BUY or SELL) on tokens above this price.
+  # Prevents quoting near-certain tokens where spread capture is negligible.
+  quote_price_max: 0.95
+
+  # STRUCTURAL EDGE FIX — never post a BUY above this price.
+  # At p=0.65 the R/R is 0.54:1, requiring 65%+ win rate to break even.
+  # Keeping BUYs at price <= 0.50 ensures R/R >= 1:1 on every entry.
+  # This is asymmetric: SELL orders are unaffected and can go above 0.50.
+  max_buy_price: 0.50
+
+  # Maximum imbalance in shares between the YES and NO legs.
+  # If YES has (max_unmatched_shares) more shares than NO, BUYs on YES are
+  # blocked until NO catches up. Forces matched-pair accumulation and caps
+  # worst-case directional exposure per window to ~max_unmatched_shares × $1.
+  max_unmatched_shares: 5
+
+  # Maximum BUY notional committed per leg per window, in USD.
+  # Once a leg has placed max_spend_per_leg_usd of BUY orders this window,
+  # no more BUYs are placed on that leg until the next window opens.
+  # Prevents overloading a single window with capital.
+  max_spend_per_leg_usd: 4
+
+  # Minimum price movement (in ticks) before an existing resting order is
+  # cancelled and replaced at the new desired price.
+  # Lower = more responsive but more cancel/replace churn and venue calls.
+  # Higher = fewer replacements, quotes may lag behind mid during fast moves.
+  replace_deadband_ticks: 3
+
+  # ── Adverse-selection guard ──────────────────────────────────────────────
+  adverse_guard:
+    # If the underlying asset (BTC/ETH/…) moved >= this fraction in the last
+    # 30 seconds, the spread is widened by widen_factor.
+    # 0.0003 = 0.03% move triggers widening.
+    btc_return_30s_widen: 0.0003
+
+    # If the move >= this fraction, the vulnerable side is pulled entirely:
+    # no BUY if price is rising, no SELL if price is falling.
+    # 0.0006 = 0.06% move triggers a full side pull.
+    btc_return_30s_pull: 0.0006
+
+  # ── Window-close behaviour ───────────────────────────────────────────────
+
+  # Seconds before market resolution at which the bot cancels all resting BUYs
+  # and attempts a FOK taker order to flatten residual inventory.
+  # Avoids holding unhedged directional exposure into the binary resolution.
+  flatten_before_sec: 30
+
+  # Only attempt the FOK flatten if the net inventory value exceeds this USD
+  # threshold. Skips the taker order (and its fee) for negligible positions.
+  flatten_if_net_above_usd: 1.0
+
+  # ── Simulator-only knobs (ignored by the live bot) ──────────────────────
+
+  # Fraction of each crossing trade captured as a fill (queue-position proxy).
+  # 1.0 = assume we're at the front of the queue (optimistic).
+  # 0.3 = assume we capture only 30% of available volume (conservative).
+  fill_participation: 1.0
+
+  # Taker fee rate for the FOK flatten order at window close.
+  # Formula: fee = shares × rate × price × (1 - price)  (~1.8% at p=0.50).
+  # Maker orders (resting limits) pay 0 fee.
+  taker_fee_rate: 0.07
+
+# -----------------------------------------------------------------------------
+# risk — simulator cap parameters (not enforced by the live bot directly)
+# -----------------------------------------------------------------------------
+risk:
+  daily_loss_limit_usd: 15.0  # max simulated daily loss before simulation stops
+  max_committed_usd: 12.0     # max capital in resting orders at any time (simulation)
+
+# -----------------------------------------------------------------------------
+# live — real-money execution settings
+# -----------------------------------------------------------------------------
+live:
+  # Master kill switch. false = dry-run (full decision loop, no real orders).
+  # Emergency stop: npm run cancel-all  (cancels all open orders immediately)
+  enabled: false
+
+  # Assets to trade concurrently in live mode.
+  # Each asset runs its own independent window loop with a shared capital cap.
+  assets: [BTC]
+
+  # Global maximum USD deployed across ALL assets at any moment.
+  # Includes: open BUY notional + inventory value (shares × mid).
+  # Prevents two concurrent asset loops from each reaching the full cap.
+  # Rule of thumb: max_spend_per_leg_usd × number_of_legs × number_of_assets + buffer.
+  max_deployed_usd: 8
+
+  # Daily loss halt. If realized P&L for the current UTC day reaches
+  # -daily_loss_halt_usd, the bot cancels all orders and idles until 00:00 UTC.
+  daily_loss_halt_usd: 2
+
+  # Session loss halt. If cumulative realized P&L since process start reaches
+  # -session_loss_halt_usd, the bot EXITS the process. Requires a manual
+  # restart after reviewing the balance. Overnight safety net.
+  session_loss_halt_usd: 3
+
+  # How often the main loop ticks (polls fills, recomputes quotes, places orders).
+  # Lower = more responsive but more API calls. 1500ms is a safe default.
+  poll_interval_ms: 1500
+
+  # How often to compare tracked share counts against the on-chain truth.
+  # Catches fill-poller lag and drift. 0 = disabled.
+  reconcile_every_sec: 30
+
+  # When drift is detected during reconciliation:
+  # true  = snap tracked shares to on-chain value (corrects accounting).
+  # false = log the discrepancy only (audit mode, no state change).
+  reconcile_correct: true

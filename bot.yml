@@ -2,7 +2,7 @@
 # Tune `maker.half_spread` and the adverse_guard thresholds from real tapes
 # via `npm run simulate` before trusting these for a live bot.
 
-assets: [BTC, ETH, SOL, XRP, BNB, DOGE]
+assets: [BTC, ETH, SOL, XRP, BNB]
 
 maker:
   # === Rebalance 2026-05-27 morning ===
@@ -10,12 +10,20 @@ maker:
   # cap 3 + inv cap 2 + max_buy 0.5) froze the bot: 4 places in 12 min, 25%
   # of reconciles in `both_sides_pulled`. Reopening selectively while KEEPING
   # the structural max_buy_price fix and tight loss caps.
-  half_spread: 0.04            # compromise (was 0.05 frozen / 0.03 too tight)
-  quote_size_usd: 2.0          # unchanged
+  # === Spread widened 2026-05-28 (profitability experiment) ===
+  # Fill analysis showed ~41% of bought shares win at ~0.40 avg = fair odds, so
+  # there is NO directional edge — the only profit source is the captured spread,
+  # and at 0.04 it was being eaten by adverse selection (filled right before the
+  # mid moves against us). Widen to 0.06 (+50%): each fill must clear a bigger
+  # cushion, so fills are fewer but should be net-positive. 8h run will tell via
+  # the reality_check net-worth trajectory + per-window cash attribution.
+  # If fills dry up entirely, step back to 0.05; if clearly profitable, try 0.08.
+  half_spread: 0.06            # was 0.04 — testing adverse-selection cushion
+  quote_size_usd: 1.0         # unchanged
   min_quote_shares: 5.0        # Polymarket min_order_size floor
   inventory_skew_k: 0.2        # gentle skew — keeps SELL from going fire-sale
   widen_factor: 2.5            # widen on volatility
-  max_inventory_usd: 2.5       # slight bump from 2.0 — allow 1 fill of 5 sh
+  max_inventory_usd: 4       # slight bump from 2.0 — allow 1 fill of 5 sh
   tick_size: 0.01              # price granularity for rounding quotes
 
   # ── Strategy mode ─────────────────────────────────────────────────────────
@@ -26,7 +34,7 @@ maker:
   disable_sell: false
 
   # ── Control knobs ────────────────────────────────────────────────────────
-  quote_price_min: 0.05        # refuse to quote below this price (no lottery-ticket BUYs)
+  quote_price_min: 0.05       # refuse to quote below this price (no lottery-ticket BUYs)
   quote_price_max: 0.95        # refuse to quote above this price (no extreme SELLs)
   # === STRUCTURAL EDGE FIX (2026-05-27) ===
   # Empirical analysis: 64% of overnight losses came from BUYs at price > 0.5.
@@ -34,8 +42,8 @@ maker:
   # Restricting BUYs to the "underdog" side (price <= 0.5) keeps R/R >= 1:1
   # on every entry. Asymmetric — does NOT affect SELL placement.
   max_buy_price: 0.50          # never post BUY above this price (STRUCTURAL FIX, keep)
-  max_unmatched_shares: 5      # back to 5 (was 4) — allow 1 unmatched fill per side
-  max_spend_per_leg_usd: 4     # ↑ from 3 — was hitting cap in 30s and going idle
+  max_unmatched_shares: 3      # back to 5 (was 4) — allow 1 unmatched fill per side
+  max_spend_per_leg_usd: 8     # ↑ from 3 — was hitting cap in 30s and going idle
   replace_deadband_ticks: 3    # only cancel+replace if desired moved >= this many ticks
 
   adverse_guard:
@@ -43,11 +51,22 @@ maker:
     # BTC vibration. BTC routinely moves 0.05-0.10% in 30s, so 0.04% pull
     # threshold was pulling ~25% of the time. New values are a compromise
     # between the original loose 0.0005/0.0010 and the over-tight new ones.
-    btc_return_30s_widen: 0.0003  # widen at 0.03% in 30s
-    btc_return_30s_pull: 0.0006   # pull at 0.06% in 30s
+    btc_return_30s_widen: 0.0005  # widen at 0.03% in 30s
+    btc_return_30s_pull: 0.0010   # pull at 0.06% in 30s
 
   flatten_before_sec: 30       # boundary where we cancel resting BUYs and (unless disable_sell) market-flatten residual
-  flatten_if_net_above_usd: 1.0  # threshold for flatten when natural flatten phase runs
+  # === Flatten threshold raised 2026-05-28 (profitability) ===
+  # At 0.03 the bot tried to market-flatten ALMOST ANY residual at close. With
+  # auto-redeem ON, that's a pure leak: in an efficient market price == win
+  # probability, so flattening at price p has the SAME expected value as holding
+  # to a 0/1 settlement — minus the taker fee. The overnight logs confirmed it:
+  # 785 flatten_skip vs 78 executed (most rode to redeem anyway) and the
+  # executed ones occasionally sold winners at 0.9 instead of redeeming at 1.0.
+  # With the hedge cap now bounding unmatched exposure to ~3 shares (~$3), the
+  # residual that rides to resolution is tiny and diversifies across windows.
+  # We only market-flatten genuinely large unhedged positions (safety valve);
+  # resting BUYs are still cancelled at the boundary regardless of this value.
+  flatten_if_net_above_usd: 5.0
 
   # ── Simulator realism knobs (ignored by the live bot) ────────────────────
   fill_participation: 1.0      # fraction of a crossing trade we capture (queue proxy); lower = more conservative
@@ -60,11 +79,32 @@ risk:
 live:
   enabled: true           # real money — kill switch is `npm run cancel-all`
   assets: [BTC]
-  max_deployed_usd: 8     # ↑ from 6 — matches max_spend (4+4) + small inventory headroom
+  max_deployed_usd: 18     # ↑ from 6 — matches max_spend (4+4) + small inventory headroom
   # Loss caps KEPT TIGHT — we want to detect any new leak with the on-chain
   # reconciler ASAP. Don't raise these until 12h of clean operation.
   daily_loss_halt_usd: 2  # idle until 00:00 UTC after $2 realized loss
-  session_loss_halt_usd: 3  # EXIT process after $3 cumulative realized loss since start
+  session_loss_halt_usd: 10  # EXIT process after $3 cumulative realized loss since start
   poll_interval_ms: 1500
-  reconcile_every_sec: 30   # on-chain position drift check cadence (0 disables)
+  # === Reconcile cadence tightened 2026-05-28 ===
+  # Overnight the /activity fill feed double-counted fills (unstable trade ids),
+  # letting tracked inventory drift to ~71 vs 38 on-chain before the reconcile
+  # corrected it. In that window the hedge/spend caps acted on garbage and
+  # positions grew to 30-40 shares (8x the 5-share cap). 10s shrinks the drift
+  # window 3x; the deriveTradeId fix removes the double-count at source.
+  reconcile_every_sec: 10   # on-chain position drift check cadence (0 disables)
   reconcile_correct: true   # snap tracked shares to on-chain truth on drift (false = log-only)
+  # Cash-floor circuit breaker (2026-05-28). Winners auto-redeem at the account
+  # level, so a falling balance is REAL losses, not locked capital. Overnight the
+  # balance fell $25 — oversized directional positions (from the tracking bug
+  # that bypassed the 5-share hedge cap) losing at resolution. Below this floor
+  # we stop opening BUYs (SELL/flatten stay on) so a losing streak can't drain
+  # the bank to zero before the daily/session halts catch it.
+  cash_floor_usd: 20
+  # Net-worth drawdown halt (2026-05-28). The daily/session halts above trust the
+  # INTERNAL mark tracker; this one reads the WALLET directly (cash + held token
+  # value via getAccountValue, checked every 90s) and hard-exits if real net
+  # worth falls this much from the start balance. It would have caught the
+  # overnight bleed regardless of the +$117 mark illusion. Catastrophe backstop —
+  # set WIDER than session_loss_halt so the mark-based halts trip first in normal
+  # operation; this only fires if the internal accounting is lying.
+  net_worth_halt_usd: 15

@@ -22,10 +22,14 @@ export function hedgeBlocksBuy(
   return legShares - otherShares >= maxUnmatchedShares;
 }
 
-/** Per-leg per-window spend cap: once cumulative BUY notional placed on this leg
- *  reaches the cap, no more BUYs on it this window (immune to fill-poll lag). */
-export function spendBlocksBuy(buyNotionalCommitted: number, maxSpendPerLegUsd: number): boolean {
-  return buyNotionalCommitted >= maxSpendPerLegUsd;
+/** Per-leg per-window spend cap. The caller supplies the EFFECTIVE BUY
+ *  exposure for this leg this window — typically `filled BUY notional + resting
+ *  BUY notional`. Once that reaches the cap, suppress further BUYs on this leg
+ *  until the next window opens. Filled+resting is preferred over "every
+ *  placement" because cancel+replace cycles would otherwise eat the cap without
+ *  ever creating real exposure (the 2026-05-27 73%-at-cap idle pathology). */
+export function spendBlocksBuy(buyExposureUsd: number, maxSpendPerLegUsd: number): boolean {
+  return buyExposureUsd >= maxSpendPerLegUsd;
 }
 
 /** Settlement price of a leg given the resolved outcome. YES pays 1 if Up won;

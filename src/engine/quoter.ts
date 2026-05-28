@@ -12,6 +12,12 @@ export interface QuoteInput {
   btcReturn30s: number | null;
   /** Seconds until the market resolves. */
   timeToResolveSec: number;
+  /** Shares held on the OTHER leg of this market (YES if we're quoting NO and
+   *  vice-versa). Lets the maxBuyPrice filter relax for hedge-BUYs: buying THIS
+   *  leg up to `otherLegShares - inventoryShares` shares converts directional
+   *  exposure into a matched pair, which is risk-reducing even at p>0.5. Default
+   *  0 keeps the original "underdog only" behavior. */
+  otherLegShares?: number;
 }
 
 export interface QuoteSidePlan {
@@ -28,6 +34,12 @@ export type QuoteDecision =
 // to avoid "lottery-ticket" extreme-price quotes.
 const VENUE_PRICE_MIN = 0.01;
 const VENUE_PRICE_MAX = 0.99;
+
+// Hedge-BUY ceiling: when the other leg has more shares than this one, we
+// permit BUYs above maxBuyPrice up to this price. The matched portion reduces
+// directional risk, but we still cap below extreme prices where rounding and
+// fees dominate the spread.
+const HEDGE_BUY_PRICE_CEILING = 0.85;
 
 /**
  * Pure market-making quote computation. No I/O. Combines:
@@ -89,7 +101,17 @@ export function computeQuotes(input: QuoteInput, cfg: MakerConfig): QuoteDecisio
   // systematically bleeds. Empirically (2026-05-27 -$23 stuck-positions
   // analysis): 64% of losses came from BUYs at price > 0.5. The ASK side
   // is unaffected — selling inventory at any price reduces risk.
-  const finalBid = bid && bid.price <= cfg.maxBuyPrice ? bid : null;
+  //
+  // HEDGE EXCEPTION: when the other leg already has more shares than THIS leg,
+  // buying THIS leg converts directional exposure into a matched pair. Up to
+  // that hedge-room amount we relax the price ceiling to HEDGE_BUY_PRICE_CEILING
+  // — the matched portion settles to cost regardless of outcome, so the per-
+  // share R/R no longer matters for those shares. Beyond the hedge room, the
+  // base maxBuyPrice rule re-applies.
+  const otherLegShares = input.otherLegShares ?? 0;
+  const hedgeRoom = Math.max(0, otherLegShares - input.inventoryShares);
+  const effectiveMaxBuyPrice = hedgeRoom > 0 ? HEDGE_BUY_PRICE_CEILING : cfg.maxBuyPrice;
+  const finalBid = bid && bid.price <= effectiveMaxBuyPrice ? bid : null;
 
   // If rounding crossed the quotes, drop both (book too tight for our spread).
   if (finalBid && ask && finalBid.price >= ask.price) {

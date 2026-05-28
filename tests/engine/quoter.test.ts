@@ -138,6 +138,52 @@ describe('computeQuotes', () => {
     expect(d.reason).toBe('buy_above_max_price');
   });
 
+  it('permits BUY above maxBuyPrice when the other leg has more shares (hedge-BUY)', () => {
+    // Same setup as the underdog-filter test (mid 0.70 → bid would be 0.67),
+    // but now the OTHER leg holds 8 shares while this leg holds 0. Buying THIS
+    // leg up to 8 shares converts directional risk into a matched pair, so the
+    // filter relaxes up to HEDGE_BUY_PRICE_CEILING (0.85).
+    const d = computeQuotes(
+      { ...base, bestBid: 0.69, bestAsk: 0.71, otherLegShares: 8 },
+      cfg,
+    );
+    if (d.action !== 'quote') throw new Error('expected quote');
+    expect(d.bid).not.toBeNull();
+    expect(d.bid!.price).toBeGreaterThan(cfg.maxBuyPrice);
+    expect(d.bid!.price).toBeLessThanOrEqual(0.85);
+  });
+
+  it('still suppresses BUY above the hedge ceiling (0.85) even when hedging', () => {
+    // mid 0.90 → bid 0.87 > 0.85 hedge ceiling. Hedge room exists but the
+    // ceiling protects against quoting at extreme prices.
+    const d = computeQuotes(
+      { ...base, bestBid: 0.89, bestAsk: 0.91, otherLegShares: 10 },
+      cfg,
+    );
+    if (d.action !== 'quote') throw new Error('expected quote');
+    expect(d.bid).toBeNull();
+    expect(d.reason).toBe('buy_above_max_price');
+  });
+
+  it('hedge-BUY does NOT trigger when this leg already matches the other', () => {
+    // Both legs hold the same number of shares → hedgeRoom = 0 → base filter
+    // still applies, BUY at 0.67 is rejected.
+    const d = computeQuotes(
+      {
+        ...base,
+        bestBid: 0.69,
+        bestAsk: 0.71,
+        inventoryShares: 8,
+        inventoryUsd: 8 * 0.7,
+        otherLegShares: 8,
+      },
+      cfg,
+    );
+    if (d.action !== 'quote') throw new Error('expected quote');
+    expect(d.bid).toBeNull();
+    expect(d.reason).toBe('buy_above_max_price');
+  });
+
   it('rounds bid down and ask up to the tick grid', () => {
     const d = computeQuotes(base, cfg);
     if (d.action !== 'quote') throw new Error('expected quote');

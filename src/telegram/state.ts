@@ -32,6 +32,7 @@ export interface BotState {
   /** Last window summary (PnL, leg breakdown) for /last. */
   lastWindow?: {
     ts: number;
+    asset: string;
     yesToken: string;
     noToken: string;
     windowPnl: number;

@@ -39,6 +39,20 @@ export class Notifier {
     );
   }
 
+  async netWorthHalt(netDeltaUsd: number, threshold: number, netWorthUsd: number): Promise<void> {
+    await this.send(
+      [
+        '🛑 *NET-WORTH HALT — process exiting*',
+        `Real drawdown: ${netDeltaUsd >= 0 ? '+' : ''}$${netDeltaUsd.toFixed(2)} (net worth $${netWorthUsd.toFixed(2)})`,
+        `Threshold: -$${threshold.toFixed(2)}`,
+        '',
+        'This reads the WALLET (cash + held tokens), not internal marks — a real',
+        'loss, not an accounting artifact. Orders cancelled. Manual restart needed',
+        'after reviewing /positions.',
+      ].join('\n'),
+    );
+  }
+
   async sessionHalt(realizedSessionUsd: number, threshold: number): Promise<void> {
     await this.send(
       [
@@ -47,6 +61,19 @@ export class Notifier {
         `Threshold: -$${threshold.toFixed(2)}`,
         '',
         'Manual restart required (`npm start`).',
+      ].join('\n'),
+    );
+  }
+
+  async cashFloor(cashUsd: number, floorUsd: number): Promise<void> {
+    await this.send(
+      [
+        '🟡 *CASH FLOOR — BUYs suppressed*',
+        `Liquid cash: $${cashUsd.toFixed(2)} < floor $${floorUsd.toFixed(2)}`,
+        '',
+        'Winners auto-redeem, so low cash means a real losing streak — not',
+        'locked capital. SELL + flatten stay active; buying auto-resumes once',
+        'cash recovers above the floor. Review /pnl and /positions first.',
       ].join('\n'),
     );
   }
@@ -62,10 +89,65 @@ export class Notifier {
   }
 
   async windowResult(windowPnl: number, realizedTodayUsd: number, yesWon: boolean | null): Promise<void> {
+    // UNRESOLVED windows: windowPnl is only a 0.5-fallback estimate AND is NOT
+    // booked into `today` (deferred). Showing a confident "+$12.75" next to
+    // "today $0.00" reads as a contradiction — and with positions now riding to
+    // resolution the provisional figure can be large and meaningless. So we do
+    // NOT print a dollar PnL for unresolved windows; the real outcome lands in
+    // net worth via auto-redeem and the periodic reality check.
+    if (yesWon === null) {
+      await this.send(
+        `⏳ Window pending resolution — not booked yet | today: $${realizedTodayUsd.toFixed(2)} (mark)`,
+      );
+      return;
+    }
+    // RESOLVED: settle is the true 0/1 outcome, so windowPnl is real PnL (given
+    // accurate share tracking). `realizedTodayUsd` is the running mark total.
     const emoji = windowPnl > 0 ? '🟢' : windowPnl < 0 ? '🔴' : '⚪';
-    const outcome = yesWon === null ? 'unresolved' : yesWon ? 'YES (Up)' : 'NO (Down)';
+    const outcome = yesWon ? 'YES (Up)' : 'NO (Down)';
     await this.send(
-      `${emoji} Window ${windowPnl >= 0 ? '+' : ''}$${windowPnl.toFixed(2)} | today: $${realizedTodayUsd.toFixed(2)} | ${outcome}`,
+      `${emoji} Window ${windowPnl >= 0 ? '+' : ''}$${windowPnl.toFixed(2)} | today: $${realizedTodayUsd.toFixed(2)} (mark) | ${outcome}`,
     );
+  }
+
+  /**
+   * Pushed reality check: the on-chain net worth (cash + held token value) vs
+   * the bot's internal mark P&L. A large positive gap means "profit" is locked
+   * in unredeemed tokens or was over-counted — exactly the divergence that made
+   * a wall of green windows hide a falling balance. Called periodically by the
+   * orchestrator. All fields are pre-fetched by the caller so this never does
+   * I/O itself.
+   */
+  async netWorthCheck(p: {
+    netWorthUsd: number;
+    startBalanceUsd: number;
+    cashUsd: number;
+    redeemableUsd: number;
+    redeemableCount: number;
+    markSessionUsd: number;
+  }): Promise<void> {
+    const netDelta = p.netWorthUsd - p.startBalanceUsd;
+    // gap > 0  => mark claims MORE profit than the wallet shows (overstated, bad).
+    // gap < 0  => wallet is ahead of mark (mark conservative — e.g. unresolved
+    //             windows whose real PnL landed in net worth but was never booked).
+    const gap = p.markSessionUsd - netDelta;
+    // Only flag the dangerous direction (mark overstating real money).
+    const flag = gap >= 5 ? '⚠️ ' : '';
+    let gapLine: string;
+    if (gap >= 0.01) {
+      gapLine = `⚠️ Mark overstates wallet by $${gap.toFixed(2)} (unredeemed / over-counted).`;
+    } else if (gap <= -0.01) {
+      gapLine = `✅ Wallet ahead of mark by $${(-gap).toFixed(2)} (mark conservative).`;
+    } else {
+      gapLine = '✅ Mark matches wallet.';
+    }
+    const lines = [
+      `${flag}*Reality check*`,
+      `Net worth: $${p.netWorthUsd.toFixed(2)} (${netDelta >= 0 ? '+' : ''}$${netDelta.toFixed(2)} vs start)`,
+      `Cash: $${p.cashUsd.toFixed(2)} | Redeemable: $${p.redeemableUsd.toFixed(2)} (${p.redeemableCount})`,
+      `Mark P&L: ${p.markSessionUsd >= 0 ? '+' : ''}$${p.markSessionUsd.toFixed(2)} session`,
+      gapLine,
+    ];
+    await this.send(lines.join('\n'));
   }
 }

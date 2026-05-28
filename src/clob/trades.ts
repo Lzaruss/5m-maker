@@ -14,18 +14,28 @@ const DATA_API = 'https://data-api.polymarket.com';
  * of fields that uniquely identify a fill within its tx.
  */
 export function deriveTradeId(r: any, tsMs: number): string {
-  return String(
-    r.id ??
-      r.tradeId ??
-      [
-        r.transactionHash ?? '',
-        r.bucketIndex ?? r.orderHash ?? r.takerOrderHash ?? r.makerOrderHash ?? '',
-        r.side ?? '',
-        r.price ?? '',
-        r.size ?? '',
-        tsMs,
-      ].join('|'),
-  );
+  // A true per-fill id is always preferred.
+  if (r.id != null) return String(r.id);
+  if (r.tradeId != null) return String(r.tradeId);
+  // Composite fallback. CRITICAL: concatenate ALL discriminator fields in a
+  // FIXED order rather than picking the first present via `??`. The old `??`
+  // chain produced a DIFFERENT id for the same fill when the API included a
+  // discriminator (e.g. bucketIndex) in one poll and omitted it in the next —
+  // so `account.seen` failed to dedup and the fill was counted again. That is
+  // the mechanism behind the overnight reconciler churn (tracked drifting to
+  // 71 vs 38 on-chain). Concatenating every field keeps batched fills distinct
+  // AND keeps the id stable across polls regardless of which fields are present.
+  return [
+    r.transactionHash ?? '',
+    r.bucketIndex ?? '',
+    r.orderHash ?? '',
+    r.takerOrderHash ?? '',
+    r.makerOrderHash ?? '',
+    r.side ?? '',
+    r.price ?? '',
+    r.size ?? '',
+    tsMs,
+  ].join('|');
 }
 
 /**
