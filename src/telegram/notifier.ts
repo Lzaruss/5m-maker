@@ -88,7 +88,52 @@ export class Notifier {
     await this.send(`👋 *Shutdown* — reason: \`${reason}\``);
   }
 
-  async windowResult(windowPnl: number, realizedTodayUsd: number, yesWon: boolean | null): Promise<void> {
+  async takeProfitHalt(realizedSessionUsd: number, threshold: number): Promise<void> {
+    await this.send(
+      [
+        '🟢 *TAKE-PROFIT STOP*',
+        `Session profit: +$${realizedSessionUsd.toFixed(2)} ≥ target $${threshold.toFixed(2)}`,
+        '',
+        'Locking in gains — bot paused until 00:00 UTC. Use /resume to lift early.',
+      ].join('\n'),
+    );
+  }
+
+  async maxWindowsHalt(windowsCount: number, realizedSessionUsd: number): Promise<void> {
+    const sign = realizedSessionUsd >= 0 ? '+' : '';
+    await this.send(
+      [
+        '⏹️ *MAX-WINDOWS STOP*',
+        `Completed ${windowsCount} window${windowsCount !== 1 ? 's' : ''} | session: ${sign}$${realizedSessionUsd.toFixed(2)}`,
+        '',
+        'Daily window limit reached — paused until 00:00 UTC. Use /resume to lift early.',
+      ].join('\n'),
+    );
+  }
+
+  async maxConsecLossesHalt(consecLosses: number, realizedSessionUsd: number): Promise<void> {
+    const sign = realizedSessionUsd >= 0 ? '+' : '';
+    await this.send(
+      [
+        '🔴 *CONSECUTIVE-LOSSES STOP*',
+        `${consecLosses} losses in a row | session: ${sign}$${realizedSessionUsd.toFixed(2)}`,
+        '',
+        'Strategy may be out of regime — paused until 00:00 UTC. Use /resume to lift early.',
+      ].join('\n'),
+    );
+  }
+
+  async windowResult(
+    windowPnl: number,
+    realizedTodayUsd: number,
+    yesWon: boolean | null,
+    /** On-chain wallet change over the window (netWorth at close − netWorth at open).
+     *  Null when the balance snapshot was unavailable. Used to cross-check the
+     *  mark-based windowPnl so that a wrong resolution (e.g. Gamma showing the
+     *  wrong winner briefly) is surfaced immediately rather than buried in the
+     *  next periodic reality-check. */
+    walletDeltaUsd?: number | null,
+  ): Promise<void> {
     // UNRESOLVED windows: windowPnl is only a 0.5-fallback estimate AND is NOT
     // booked into `today` (deferred). Showing a confident "+$12.75" next to
     // "today $0.00" reads as a contradiction — and with positions now riding to
@@ -103,10 +148,31 @@ export class Notifier {
     }
     // RESOLVED: settle is the true 0/1 outcome, so windowPnl is real PnL (given
     // accurate share tracking). `realizedTodayUsd` is the running mark total.
-    const emoji = windowPnl > 0 ? '🟢' : windowPnl < 0 ? '🔴' : '⚪';
+    // When a wallet snapshot is available, use the REAL wallet movement for the
+    // lead emoji and flag any mark/wallet mismatch immediately.
     const outcome = yesWon ? 'YES (Up)' : 'NO (Down)';
+    const pnlSign = (n: number) => (n >= 0 ? '+' : '');
+    let walletLine = '';
+    let mismatchWarning = '';
+    if (walletDeltaUsd != null) {
+      walletLine = ` | wallet: ${pnlSign(walletDeltaUsd)}$${walletDeltaUsd.toFixed(2)}`;
+      // Flag when mark and wallet disagree by more than $0.50 AND point in
+      // opposite directions. This is the "false-win" scenario.
+      const signDiffers =
+        Math.sign(windowPnl) !== 0 &&
+        Math.sign(walletDeltaUsd) !== 0 &&
+        Math.sign(windowPnl) !== Math.sign(walletDeltaUsd);
+      const largeDiff = Math.abs(windowPnl - walletDeltaUsd) >= 0.5;
+      if (signDiffers || largeDiff) {
+        mismatchWarning = ` ⚠️ mark/wallet gap $${Math.abs(windowPnl - walletDeltaUsd).toFixed(2)}`;
+      }
+    }
+    // Drive the emoji from the wallet when available (ground truth) so that a
+    // wrong mark never shows a green when the wallet is in the red.
+    const realPnl = walletDeltaUsd ?? windowPnl;
+    const emoji = realPnl >= 0 ? '🟢' : '🔴';
     await this.send(
-      `${emoji} Window ${windowPnl >= 0 ? '+' : ''}$${windowPnl.toFixed(2)} | today: $${realizedTodayUsd.toFixed(2)} (mark) | ${outcome}`,
+      `${emoji} Window ${pnlSign(windowPnl)}$${windowPnl.toFixed(2)} (mark)${walletLine}${mismatchWarning} | today: $${realizedTodayUsd.toFixed(2)} (mark) | ${outcome}`,
     );
   }
 

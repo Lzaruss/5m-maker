@@ -87,7 +87,12 @@ async function main(): Promise<void> {
 
   // tokenId -> asset, for stamping BTC context on each event.
   const tokenAsset = new Map<string, Asset>();
-  // tokenId -> tracked market, for retention bookkeeping.
+  // tokenId -> outcome side. We record BOTH legs (YES + NO) of each market so
+  // the favorite's REAL book is captured whichever side it is on — required by
+  // the favorite-bias harvester (a maker/taker on the favorite needs that side's
+  // touch, not a complement approximation).
+  const tokenSide = new Map<string, 'YES' | 'NO'>();
+  // tracked market keyed by yesTokenId, for retention bookkeeping.
   const tracked = new Map<string, TrackedMarket>();
 
   const feed = new ClobMarketFeed({
@@ -99,6 +104,7 @@ async function main(): Promise<void> {
         t: 'book',
         ts: snap.ts,
         tokenId: snap.assetId,
+        side: tokenSide.get(snap.assetId) ?? null,
         // Top-of-book scalars (consumed by the current simulator).
         bid: bestBid?.price ?? null,
         bidSz: bestBid?.size ?? null,
@@ -119,6 +125,7 @@ async function main(): Promise<void> {
         t: 'trade',
         ts: trade.ts,
         tokenId: trade.assetId,
+        outcomeSide: tokenSide.get(trade.assetId) ?? null,
         price: trade.price,
         size: trade.size,
         side: trade.side,
@@ -138,6 +145,9 @@ async function main(): Promise<void> {
         if (!tracked.has(m.yesTokenId)) {
           tracked.set(m.yesTokenId, { market: m, announced: false, resolved: false });
           tokenAsset.set(m.yesTokenId, m.asset);
+          tokenAsset.set(m.noTokenId, m.asset);
+          tokenSide.set(m.yesTokenId, 'YES');
+          tokenSide.set(m.noTokenId, 'NO');
         }
       }
 
@@ -150,14 +160,24 @@ async function main(): Promise<void> {
         const res = await fetchResolution(tm.market.yesTokenId);
         if (res) {
           tm.resolved = true;
-          write({
-            t: 'resolution',
-            ts: Date.now(),
-            tokenId: tm.market.yesTokenId,
-            asset: tm.market.asset,
-            yesWon: res.yesWon,
-            upPrice: res.upPrice,
-          });
+          // Write a resolution line for BOTH legs with a per-token `won` flag
+          // (did THIS token settle to $1) so calibration/backtests can use the
+          // recorded token's own price→outcome directly, whichever side it is.
+          for (const [tokenId, side] of [
+            [tm.market.yesTokenId, 'YES'] as const,
+            [tm.market.noTokenId, 'NO'] as const,
+          ]) {
+            write({
+              t: 'resolution',
+              ts: Date.now(),
+              tokenId,
+              side,
+              asset: tm.market.asset,
+              won: side === 'YES' ? res.yesWon : !res.yesWon,
+              yesWon: res.yesWon,
+              upPrice: res.upPrice,
+            });
+          }
         }
       }
 
@@ -170,7 +190,10 @@ async function main(): Promise<void> {
         const timedOut = resolveTime + RESOLUTION_MAX_WAIT_MS < now;
         if ((tm.resolved && retainedEnough) || timedOut) {
           tracked.delete(tokenId);
-          tokenAsset.delete(tokenId);
+          tokenAsset.delete(tm.market.yesTokenId);
+          tokenAsset.delete(tm.market.noTokenId);
+          tokenSide.delete(tm.market.yesTokenId);
+          tokenSide.delete(tm.market.noTokenId);
         }
       }
 
@@ -180,32 +203,43 @@ async function main(): Promise<void> {
         if (tm.announced) continue;
         tm.announced = true;
         const clobRewards = await fetchClobRewards(tm.market.conditionId);
-        write({
-          t: 'market',
-          ts: Date.now(),
-          tokenId: tm.market.yesTokenId,
-          conditionId: tm.market.conditionId,
-          asset: tm.market.asset,
-          resolvesAt: tm.market.resolvesAt.getTime(),
-          windowMinutes: tm.market.windowMinutes,
-          question: tm.market.question,
-          // Liquidity-rewards config. `rewardsRates` is the ground truth: null
-          // => the market pays NO liquidity rewards (current 5m crypto case).
-          rewardsMaxSpread: tm.market.rewardsMaxSpread,
-          rewardsMinSize: tm.market.rewardsMinSize,
-          rewardsRates: clobRewards ? clobRewards.rates : undefined,
-          rewardsActive: clobRewards ? (clobRewards.rates?.length ?? 0) > 0 : null,
-          gammaSpread: tm.market.gammaSpread,
-          // Fee schedule + maker rebate — the real maker economics here.
-          feeRate: tm.market.feeRate,
-          feeExponent: tm.market.feeExponent,
-          feeTakerOnly: tm.market.feeTakerOnly,
-          rebateRate: tm.market.rebateRate,
-        });
+        // Announce BOTH legs (YES + NO), paired by conditionId, each tagged with
+        // its outcome side so downstream tools know which token's price is which.
+        for (const [tokenId, side] of [
+          [tm.market.yesTokenId, 'YES'] as const,
+          [tm.market.noTokenId, 'NO'] as const,
+        ]) {
+          write({
+            t: 'market',
+            ts: Date.now(),
+            tokenId,
+            side,
+            conditionId: tm.market.conditionId,
+            asset: tm.market.asset,
+            resolvesAt: tm.market.resolvesAt.getTime(),
+            windowMinutes: tm.market.windowMinutes,
+            question: tm.market.question,
+            // Liquidity-rewards config. `rewardsRates` is the ground truth: null
+            // => the market pays NO liquidity rewards (current 5m crypto case).
+            rewardsMaxSpread: tm.market.rewardsMaxSpread,
+            rewardsMinSize: tm.market.rewardsMinSize,
+            rewardsRates: clobRewards ? clobRewards.rates : undefined,
+            rewardsActive: clobRewards ? (clobRewards.rates?.length ?? 0) > 0 : null,
+            gammaSpread: tm.market.gammaSpread,
+            // Fee schedule + maker rebate — the real maker economics here.
+            feeRate: tm.market.feeRate,
+            feeExponent: tm.market.feeExponent,
+            feeTakerOnly: tm.market.feeTakerOnly,
+            rebateRate: tm.market.rebateRate,
+          });
+        }
       }
 
-      feed.setAssets([...tracked.keys()]);
-      logger.info({ tracked: tracked.size, lines }, 'Recorder tick');
+      // Subscribe BOTH legs of every tracked market.
+      const subTokens: string[] = [];
+      for (const tm of tracked.values()) subTokens.push(tm.market.yesTokenId, tm.market.noTokenId);
+      feed.setAssets(subTokens);
+      logger.info({ tracked: tracked.size, tokens: subTokens.length, lines }, 'Recorder tick');
     } catch (err: any) {
       logger.error({ err: err.message }, 'Recorder refresh failed');
     }
@@ -226,6 +260,24 @@ async function main(): Promise<void> {
   };
   process.on('SIGINT', () => shutdown('SIGINT'));
   process.on('SIGTERM', () => shutdown('SIGTERM'));
+  // Crash diagnosability (the recorder had NONE — a throw on any async path
+  // killed it with no log line, which looked like "it just stops"). Now every
+  // exit reason is logged and the tape is flushed.
+  //   - uncaughtException: state may be inconsistent -> log + flush + exit (restart).
+  //   - unhandledRejection: usually a transient async reject (a dropped fetch/WS
+  //     promise) -> LOG and KEEP RECORDING; losing a multi-hour session over a
+  //     blip is worse than continuing.
+  //   - tape stream error: log; do not crash.
+  process.on('uncaughtException', (err: any) => {
+    logger.error({ err: err?.message, stack: err?.stack }, 'Recorder uncaughtException — flushing and exiting');
+    shutdown('uncaughtException');
+  });
+  process.on('unhandledRejection', (reason: any) => {
+    logger.error({ reason: reason?.message ?? String(reason) }, 'Recorder unhandledRejection — continuing');
+  });
+  out.on('error', (err: any) => {
+    logger.error({ err: err?.message }, 'Recorder tape stream error — continuing');
+  });
 
   // Auto-stop after the requested duration, flushing the tape cleanly.
   if (durationMs) setTimeout(() => shutdown('duration_reached'), durationMs);

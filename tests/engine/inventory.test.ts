@@ -28,6 +28,12 @@ const cfg: MakerConfig = {
   replaceDeadbandTicks: 3,
   fillParticipation: 1.0,
   takerFeeRate: 0.07,
+  minPairProfitPerShare: 0.02,
+  noTradeBand50: 0,
+  noNewEntryBeforeSec: 0,
+  volHaltReturn30s: 0,
+  minBookDepthShares: 0,
+  pegToTouch: false,
 };
 
 describe('applyFill', () => {

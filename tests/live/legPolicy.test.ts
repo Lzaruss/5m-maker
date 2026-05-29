@@ -21,6 +21,7 @@ const base: BuildDesiredParams = {
   bestBid: 0.49,
   bestAsk: 0.53,
   legShares: 100, // plenty to back a SELL
+  otherLegShares: 0, // fully unmatched -> all 100 are excess, eligible to sell
   hedgeBlocksBuy: false,
   spendBlocksBuy: false,
   disableSell: false,
@@ -97,6 +98,24 @@ describe('buildDesired', () => {
   it('suppresses SELL when we do not own enough shares (no naked short)', () => {
     const d = buildDesired({ ...base, legShares: 3 }); // ask wants 6
     expect(d).toEqual([{ side: 'BUY', price: 0.47, size: 6 }]);
+  });
+
+  it('holds the matched-pair core: no SELL when legs are fully matched', () => {
+    // 100 vs 100 -> unmatched excess 0 -> nothing eligible to sell; rides to redeem
+    const d = buildDesired({ ...base, legShares: 100, otherLegShares: 100 });
+    expect(d.find((q) => q.side === 'SELL')).toBeUndefined();
+  });
+
+  it('suppresses SELL when unmatched excess is below a full clip', () => {
+    // excess 4 < ask size 6 -> no SELL (would nibble into the matched core)
+    const d = buildDesired({ ...base, legShares: 100, otherLegShares: 96 });
+    expect(d.find((q) => q.side === 'SELL')).toBeUndefined();
+  });
+
+  it('sells only the unmatched excess when it covers a full clip', () => {
+    // excess 10 >= ask size 6 -> SELL the excess, never the matched core
+    const d = buildDesired({ ...base, legShares: 100, otherLegShares: 90 });
+    expect(d).toContainEqual({ side: 'SELL', price: 0.54, size: 6 });
   });
 
   it('suppresses SELL that would cross the touch (ask <= bestBid)', () => {

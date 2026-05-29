@@ -193,7 +193,16 @@ function takerFee(price: number, shares: number, feeRate: number): number {
   return shares * feeRate * price * (1 - price);
 }
 
-function simulate(windows: Window[], cfg: MakerConfig): SimMetrics {
+interface SimOpts {
+  /** Delta-neutral approximation: never post/realize a maker SELL and never
+   *  flatten — buy maker on the underdog and HOLD to 0/1 resolution. Summed
+   *  across a market's YES and NO legs this is exactly "hold matched pairs +
+   *  naked singles to settlement", the dominant behavior of the live
+   *  delta-neutral bot (which only ever unwinds excess, rarely). */
+  hold: boolean;
+}
+
+function simulate(windows: Window[], cfg: MakerConfig, opts: SimOpts = { hold: false }): SimMetrics {
   const m: SimMetrics = {
     windows: 0,
     totalPnl: 0,
@@ -286,7 +295,7 @@ function simulate(windows: Window[], cfg: MakerConfig): SimMetrics {
         // Hybrid close: flatten large inventory at the touch once in the window.
         // Crossing the book makes us a TAKER, so a dynamic taker fee applies.
         const close = closeGate(inv, lastMid, timeToResolveSec, cfg);
-        if (close.action === 'flatten' && !flattened) {
+        if (close.action === 'flatten' && !flattened && !opts.hold) {
           const qty = Math.abs(inv.shares);
           if (inv.shares > 0) {
             inv = applyFill(inv, { side: 'SELL', price: lastBid, shares: qty });
@@ -375,7 +384,7 @@ function simulate(windows: Window[], cfg: MakerConfig): SimMetrics {
             m.fills++;
             m.buyShares += fillShares;
           }
-        } else if (askPrice !== null && p >= askPrice && askRemaining > 0) {
+        } else if (!opts.hold && askPrice !== null && p >= askPrice && askRemaining > 0) {
           const queueAhead = askPrice < bestAsk ? 0 : bestAskSz; // front only if we improved; else size ahead
           const reach = Math.max(0, sz - queueAhead) * cfg.fillParticipation;
           const clamp = Math.max(0, inv.shares + maxShares(askPrice));
@@ -453,6 +462,15 @@ function report(label: string, m: SimMetrics): void {
   console.log(`P&L per window      : ${fmtUsd(m.windows ? m.totalPnl / m.windows : 0)}`);
   console.log(`winning windows     : ${wins}/${m.windows} (${pct(wins, m.windows)})`);
   console.log(`best / worst window : ${fmtUsd(best)} / ${fmtUsd(worst)}`);
+  // Per-window PnL mean ± std (σ_w). In --hold mode this is the SPREAD/trading
+  // component (rebate=0 in sim) — the variance the rebate farm must overcome.
+  const mean = m.windows ? m.totalPnl / m.windows : 0;
+  const variance = m.windows > 1
+    ? m.pnls.reduce((s, p) => s + (p - mean) ** 2, 0) / (m.windows - 1)
+    : 0;
+  const std = Math.sqrt(variance);
+  const sharpe = std > 0 ? mean / std : 0;
+  console.log(`per-window mean ± σ : ${fmtUsd(mean)} ± ${fmtUsd(std)}  (Sharpe/√window ${sharpe.toFixed(3)})`);
   console.log(`fills               : ${m.fills}`);
   console.log(`buy / sell shares   : ${m.buyShares.toFixed(0)} / ${m.sellShares.toFixed(0)}`);
   console.log(`completed rounds(sh): ${completedRounds.toFixed(0)}`);
@@ -495,11 +513,16 @@ function main(): void {
   const tapePaths: string[] = [];
   let singleSpread: number | null = null;
   let assetFilter: Set<string> | null = null;
+  let hold = false;
+  let peg = false;
   for (let i = 0; i < args.length; i++) {
     if (args[i] === '--spread') singleSpread = Number(args[++i]);
     else if (args[i] === '--assets') assetFilter = new Set(args[++i].toUpperCase().split(','));
+    else if (args[i] === '--hold') hold = true;
+    else if (args[i] === '--peg') peg = true;
     else if (!args[i].startsWith('--')) tapePaths.push(resolve(args[i]));
   }
+  const opts: SimOpts = { hold };
   const paths = tapePaths.length ? tapePaths : allTapes();
 
   const cfg = loadBotYaml();
@@ -512,14 +535,16 @@ function main(): void {
   console.log(
     `Realism knobs: fill_participation=${cfg.maker.fillParticipation}, taker_fee_rate=${cfg.maker.takerFeeRate}, queue model ON`,
   );
+  if (hold) console.log(`MODE: --hold (delta-neutral approx: buy maker + hold to 0/1, no SELL/flatten). For 5m markets read the SPREAD component (rebate=0, no rewards).`);
+  if (peg) console.log(`MODE: --peg (pegToTouch ON — quotes join the touch to actually fill, instead of sitting half_spread behind).`);
   if (windows.length === 0) {
     console.log('No complete windows with metadata to simulate. Record more tape.');
     return;
   }
 
   if (singleSpread !== null) {
-    const m = simulate(windows, { ...cfg.maker, halfSpread: singleSpread });
-    report(`half_spread=${singleSpread}`, m);
+    const m = simulate(windows, { ...cfg.maker, halfSpread: singleSpread, pegToTouch: peg }, opts);
+    report(`half_spread=${singleSpread}${hold ? ' (hold)' : ''}${peg ? ' (peg)' : ''}`, m);
     reportBreakdowns(m);
     return;
   }
@@ -530,8 +555,8 @@ function main(): void {
   let bestSpread = spreads[0];
   let bestMetrics: SimMetrics | null = null;
   for (const hs of spreads) {
-    const m = simulate(windows, { ...cfg.maker, halfSpread: hs });
-    report(`half_spread=${hs}`, m);
+    const m = simulate(windows, { ...cfg.maker, halfSpread: hs, pegToTouch: peg }, opts);
+    report(`half_spread=${hs}${hold ? ' (hold)' : ''}${peg ? ' (peg)' : ''}`, m);
     if (m.totalPnl > bestPnl) {
       bestPnl = m.totalPnl;
       bestSpread = hs;

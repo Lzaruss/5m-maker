@@ -22,6 +22,14 @@ const cfg: MakerConfig = {
   replaceDeadbandTicks: 3,
   fillParticipation: 1.0,
   takerFeeRate: 0.07,
+  minPairProfitPerShare: 0.02,
+  // Tier-2 gates DISABLED in the base fixture so the original tests are
+  // unaffected; each gate test below enables exactly what it exercises.
+  noTradeBand50: 0,
+  noNewEntryBeforeSec: 0,
+  volHaltReturn30s: 0,
+  minBookDepthShares: 0,
+  pegToTouch: false,
 };
 
 const base: QuoteInput = {
@@ -182,6 +190,93 @@ describe('computeQuotes', () => {
     if (d.action !== 'quote') throw new Error('expected quote');
     expect(d.bid).toBeNull();
     expect(d.reason).toBe('buy_above_max_price');
+  });
+
+  // ── Tier-2 entry/regime gates ───────────────────────────────────────────
+  describe('Tier-2 gates', () => {
+    it('vol_regime_halt: pauses BOTH sides on an extreme move', () => {
+      const c = { ...cfg, volHaltReturn30s: 0.0025 };
+      const d = computeQuotes({ ...base, btcReturn30s: 0.003 }, c);
+      expect(d).toEqual({ action: 'no_quote', reason: 'vol_regime_halt' });
+    });
+
+    it('vol_regime_halt: does not fire below the threshold', () => {
+      const c = { ...cfg, volHaltReturn30s: 0.0025 };
+      const d = computeQuotes({ ...base, btcReturn30s: 0.001 }, c);
+      expect(d.action).toBe('quote');
+    });
+
+    it('thin_book: no_quote when either side is below min depth', () => {
+      const c = { ...cfg, minBookDepthShares: 20 };
+      const d = computeQuotes({ ...base, bidDepthShares: 5, askDepthShares: 100 }, c);
+      expect(d).toEqual({ action: 'no_quote', reason: 'thin_book' });
+    });
+
+    it('thin_book: quotes when both sides meet min depth', () => {
+      const c = { ...cfg, minBookDepthShares: 20 };
+      const d = computeQuotes({ ...base, bidDepthShares: 50, askDepthShares: 50 }, c);
+      expect(d.action).toBe('quote');
+    });
+
+    it('thin_book: gate is skipped when depth is not supplied', () => {
+      const c = { ...cfg, minBookDepthShares: 20 };
+      const d = computeQuotes(base, c); // no depth fields
+      expect(d.action).toBe('quote');
+    });
+
+    it('near_50_no_edge: suppresses the opening BUY in the dead zone, keeps the ask', () => {
+      const c = { ...cfg, noTradeBand50: 0.04 }; // base mid = 0.51 -> inside
+      const d = computeQuotes(base, c);
+      if (d.action !== 'quote') throw new Error('expected quote');
+      expect(d.bid).toBeNull();
+      expect(d.ask).not.toBeNull();
+      expect(d.reason).toBe('near_50_no_edge');
+    });
+
+    it('near_50_no_edge: hedge-completion BUY is EXEMPT', () => {
+      const c = { ...cfg, noTradeBand50: 0.04 };
+      // other leg heavier -> hedgeRoom > 0 -> this BUY reduces risk -> allowed
+      const d = computeQuotes({ ...base, otherLegShares: 8 }, c);
+      if (d.action !== 'quote') throw new Error('expected quote');
+      expect(d.bid).not.toBeNull();
+    });
+
+    it('late_no_entry: suppresses opening BUY inside the no-new-entry window', () => {
+      const c = { ...cfg, noNewEntryBeforeSec: 90 };
+      const d = computeQuotes({ ...base, timeToResolveSec: 60 }, c);
+      if (d.action !== 'quote') throw new Error('expected quote');
+      expect(d.bid).toBeNull();
+      expect(d.ask).not.toBeNull();
+      expect(d.reason).toBe('late_no_entry');
+    });
+
+    it('late_no_entry: still allows opening earlier in the window', () => {
+      const c = { ...cfg, noNewEntryBeforeSec: 90 };
+      const d = computeQuotes({ ...base, timeToResolveSec: 120 }, c);
+      if (d.action !== 'quote') throw new Error('expected quote');
+      expect(d.bid).not.toBeNull();
+    });
+
+    it('late_no_entry: hedge-completion BUY is EXEMPT late in the window', () => {
+      const c = { ...cfg, noNewEntryBeforeSec: 90 };
+      const d = computeQuotes({ ...base, timeToResolveSec: 60, otherLegShares: 8 }, c);
+      if (d.action !== 'quote') throw new Error('expected quote');
+      expect(d.bid).not.toBeNull();
+    });
+
+    it('peg_to_touch: a behind-the-book bid is lifted to the best bid', () => {
+      // wide book: bestBid 0.40, bestAsk 0.60, mid 0.50. half_spread 0.03 → bid
+      // would be ~0.47 (BEHIND? no — inside). Use a tight book to force "behind":
+      // bestBid 0.49, bestAsk 0.51, mid 0.50, half_spread 0.03 → bid 0.47 < 0.49.
+      const c = { ...cfg, pegToTouch: true, maxBuyPrice: 1.0 };
+      const off = computeQuotes({ ...base, bestBid: 0.49, bestAsk: 0.51 }, { ...c, pegToTouch: false });
+      const on = computeQuotes({ ...base, bestBid: 0.49, bestAsk: 0.51 }, c);
+      if (off.action !== 'quote' || on.action !== 'quote') throw new Error('expected quotes');
+      expect(off.bid!.price).toBeLessThan(0.49);   // behind the best bid (won't fill)
+      expect(on.bid!.price).toBe(0.49);            // pegged up to join the best bid
+      expect(on.ask!.price).toBe(0.51);            // pegged down to join the best ask
+      expect(on.bid!.price).toBeLessThan(on.ask!.price);
+    });
   });
 
   it('rounds bid down and ask up to the tick grid', () => {

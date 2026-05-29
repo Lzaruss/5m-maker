@@ -50,6 +50,10 @@ export interface BuildDesiredParams {
   bestAsk: number;
   /** Realized share inventory on this leg (backs SELL orders). */
   legShares: number;
+  /** Realized share inventory on the OTHER leg of this market. Used by the
+   *  delta-neutral SELL rule: only the UNMATCHED excess (legShares -
+   *  otherLegShares) may be sold — the matched-pair core rides to redemption. */
+  otherLegShares: number;
   /** Blocks computed by the caller. */
   hedgeBlocksBuy: boolean;
   spendBlocksBuy: boolean;
@@ -65,9 +69,19 @@ export interface BuildDesiredParams {
  *        hedge cap not hit, spend cap not hit, and the bid would NOT cross the
  *        touch (postOnly would reject a BUY at/above bestAsk).
  *   SELL is posted only if: SELL not disabled, quoter wants an ask, gate allows
- *        sell, we OWN enough shares to back it (naked SELL is rejected by the
- *        venue), and the ask would NOT cross the touch (postOnly rejects a SELL
- *        at/below bestBid).
+ *        sell, the ask would NOT cross the touch (postOnly rejects a SELL
+ *        at/below bestBid), AND the UNMATCHED EXCESS on this leg is at least a
+ *        full clip.
+ *
+ * DELTA-NEUTRAL SELL RULE (2026-05-28): the matched-pair core —
+ * min(legShares, otherLegShares) — is held to resolution where it redeems for
+ * a guaranteed $1 (locked profit, since pair cost < $1). Only the unmatched
+ * excess (legShares - otherLegShares) represents naked directional risk, so
+ * only that excess may be unwound via SELL. This eliminates the disposition
+ * leak proven across 2026-05-26/27/28: the old `legShares >= ask.sizeShares`
+ * rule sold ANY owned shares, which mechanically clipped 80-96% of winning legs
+ * at a thin spread while losers (whose asks never filled) rode to $0. Selling
+ * only the excess never touches the hedged core, so winners ride to redemption.
  */
 export function buildDesired(p: BuildDesiredParams): DesiredQuote[] {
   const desired: DesiredQuote[] = [];
@@ -79,11 +93,15 @@ export function buildDesired(p: BuildDesiredParams): DesiredQuote[] {
     desired.push({ side: 'BUY', price: bid.price, size: bid.sizeShares });
   }
 
+  // Only the naked excess over the matched pair is eligible to sell. Requiring
+  // the excess to cover a full clip (ask.sizeShares >= venue min) also prevents
+  // posting an unsellably-small SELL and prevents nibbling into the matched core.
+  const unmatchedExcess = Math.max(0, p.legShares - p.otherLegShares);
   if (
     !p.disableSell &&
     ask &&
     p.allowSell &&
-    p.legShares >= ask.sizeShares &&
+    unmatchedExcess >= ask.sizeShares &&
     ask.price > p.bestBid
   ) {
     desired.push({ side: 'SELL', price: ask.price, size: ask.sizeShares });

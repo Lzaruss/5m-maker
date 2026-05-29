@@ -8,7 +8,7 @@
     "typecheck": "tsc --noEmit",
     "start": "npm run tsnode -- src/index.ts",
     "build": "tsc",
-    "tsnode": "node --no-deprecation --import \"data:text/javascript,import { register } from 'node:module'; import { pathToFileURL } from 'node:url'; register('ts-node/esm', pathToFileURL('./'));\"",
+    "tsnode": "tsx",
     "test": "vitest",
     "test:run": "vitest run",
     "record": "npm run tsnode -- scripts/recorder.ts",
@@ -33,6 +33,7 @@
     "@types/node": "^20.10.0",
     "@types/ws": "^8.5.8",
     "ts-node": "^10.9.1",
+    "tsx": "^4.22.3",
     "typescript": "^5.3.3",
     "vitest": "^1.1.0"
   },

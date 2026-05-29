@@ -2,7 +2,7 @@
 # Tune `maker.half_spread` and the adverse_guard thresholds from real tapes
 # via `npm run simulate` before trusting these for a live bot.
 
-assets: [BTC, ETH, SOL, XRP, BNB]
+assets: [BTC, ETH, SOL, XRP, BNB, DOGE]
 
 maker:
   # === Rebalance 2026-05-27 morning ===
@@ -10,15 +10,31 @@ maker:
   # cap 3 + inv cap 2 + max_buy 0.5) froze the bot: 4 places in 12 min, 25%
   # of reconciles in `both_sides_pulled`. Reopening selectively while KEEPING
   # the structural max_buy_price fix and tight loss caps.
-  # === Spread widened 2026-05-28 (profitability experiment) ===
-  # Fill analysis showed ~41% of bought shares win at ~0.40 avg = fair odds, so
-  # there is NO directional edge — the only profit source is the captured spread,
-  # and at 0.04 it was being eaten by adverse selection (filled right before the
-  # mid moves against us). Widen to 0.06 (+50%): each fill must clear a bigger
-  # cushion, so fills are fewer but should be net-positive. 8h run will tell via
-  # the reality_check net-worth trajectory + per-window cash attribution.
-  # If fills dry up entirely, step back to 0.05; if clearly profitable, try 0.08.
-  half_spread: 0.06            # was 0.04 — testing adverse-selection cushion
+  # === half_spread re-grounded in microstructure 2026-05-28 ===
+  # Rule: half_spread must be ~0.5x the LIVE book spread to be competitive. Quote
+  # wider than the book's half-spread and your bid sits BEHIND best bid — the only
+  # way it fills is the price moving that far to reach you, i.e. informed/adverse
+  # flow (this is why BTC fills won 5-24% to resolution). Tape medians: BTC 1c
+  # (untradeable for a maker), but BNB ~7c and DOGE ~6c. 0.03 sits inside/at the
+  # best bid on those alts -> fills on noise (mean-reverting), not on crashes.
+  # Edge per matched pair = 2 x half_spread ~= $0.06. If alt fills dry up, this is
+  # the FIRST lever (alts are 2-3x more volatile, so the BTC-tuned adverse_guard
+  # below may already be pulling a lot). Do NOT raise above the chosen asset's
+  # half-spread or every fill becomes adverse again.
+  half_spread: 0.03            # was 0.06 (BTC); 0.03 is competitive for BNB/DOGE 6-7c books
+  # === Per-asset half_spread (2026-05-29, breadth for the rebate farm) ===
+  # Rule (microstructure + two-leg backtest): half_spread ≈ 0.5× the asset's BOOK
+  # spread, or the bid sits behind the touch and only fills adversely. Tape
+  # medians: BNB/DOGE ~6c → 0.03 (global); XRP ~3c → 0.015; SOL ~2c → 0.01.
+  # In the two-leg backtest, matching the spread to the book LIFTED both-leg fills
+  # massively (XRP 0%→11%, SOL→17% vs BNB/DOGE 2% at the wrong spread) — the
+  # lowest-competition books (XRP depth ~10, SOL ~16) hedge best when quoted
+  # competitively. Assets not listed use `half_spread`. ETH/BTC excluded (1c books
+  # untradeable for a maker). More independent markets ⇒ variance ∝1/√N at the
+  # SAME globally-bounded capital (max_deployed_usd is a cross-asset sum).
+  half_spread_by_asset:
+    XRP: 0.015
+    SOL: 0.01
   quote_size_usd: 1.0         # unchanged
   min_quote_shares: 5.0        # Polymarket min_order_size floor
   inventory_skew_k: 0.2        # gentle skew — keeps SELL from going fire-sale
@@ -44,7 +60,43 @@ maker:
   max_buy_price: 0.50          # never post BUY above this price (STRUCTURAL FIX, keep)
   max_unmatched_shares: 3      # back to 5 (was 4) — allow 1 unmatched fill per side
   max_spend_per_leg_usd: 8     # ↑ from 3 — was hitting cap in 30s and going idle
-  replace_deadband_ticks: 3    # only cancel+replace if desired moved >= this many ticks
+  # ↑ 3→4 (2026-05-28): 59-274 reconciles per fill in the logs. A wider deadband
+  # cuts cancel+replace churn AND the cancel-fill races that let inventory drift
+  # past the hedge cap (the imbalance-blowout signature). Quotes go slightly more
+  # stale — negligible vs the race risk.
+  replace_deadband_ticks: 4    # only cancel+replace if desired moved >= this many ticks
+
+  # ── Even-money pair guarantee (2026-05-29) ───────────────────────────────
+  # The hedge-BUY ceiling is now DYNAMIC:
+  #   hedgeCeiling = min(0.85, 1.0 - otherLegAvgCost - min_pair_profit_per_share)
+  # At 0.02, before completing a YES+NO pair the bot verifies the second leg
+  # can be bought such that total pair cost <= $0.98 -> locked-in >= $0.02
+  # profit regardless of outcome. Prevents the fixed-ceiling bug where a
+  # market move after the first fill could produce pair_cost > $1 (guaranteed
+  # loss). Set to 0 to revert to the old fixed-ceiling behaviour.
+  min_pair_profit_per_share: 0.02
+
+
+  # All suppress OPENING new directional risk in low-edge/toxic conditions but
+  # never block de-risking (hedge-completion BUYs are exempt; the unwind SELL is
+  # untouched). Set any to 0 to disable.
+  # No-trade dead zone around 0.50: coinflip windows have ~0 maker edge (pair
+  # cost ≈ 1) and the highest implicit fee/structure cost. 0.04 => skip opening
+  # BUYs when mid ∈ [0.46, 0.54]. Confirmed by data: near-50 pairs cost 0.93-0.99.
+  no_trade_band_50: 0.04
+  # Stop OPENING inside the last 90s — late entries are adversely selected (late
+  # buys won 0-17% vs ~40% baseline). Must be > flatten_before_sec (30) so there
+  # is a de-risk-only window. Hedge-completion + unwind still run.
+  no_new_entry_before_sec: 90
+  # Volatility hard-pause: |assetReturn30s| >= this => no_quote BOTH sides (cancel
+  # resting, stand aside). Set ABOVE adverse_guard.pull (0.0010). 0.0025 = a
+  # violent 0.25%/30s move. NOTE: alts are more volatile than BTC — if this fires
+  # too often on BNB/DOGE, raise it (toward 0.004) rather than disabling.
+  vol_halt_return_30s: 0.0025
+  # Minimum top-of-book depth (shares) on BOTH sides to quote. Thin books gap on
+  # a single taker and pick off resting quotes. Conservative; raise if alt books
+  # are routinely thin and this starves fills.
+  min_book_depth_shares: 0
 
   adverse_guard:
     # Relaxed from the over-tight 0.0002/0.0004 that was triggering on every
@@ -52,7 +104,7 @@ maker:
     # threshold was pulling ~25% of the time. New values are a compromise
     # between the original loose 0.0005/0.0010 and the over-tight new ones.
     btc_return_30s_widen: 0.0005  # widen at 0.03% in 30s
-    btc_return_30s_pull: 0.0010   # pull at 0.06% in 30s
+    btc_return_30s_pull: 0.0020   # pull at 0.06% in 30s
 
   flatten_before_sec: 30       # boundary where we cancel resting BUYs and (unless disable_sell) market-flatten residual
   # === Flatten threshold raised 2026-05-28 (profitability) ===
@@ -78,20 +130,43 @@ risk:
 
 live:
   enabled: true           # real money — kill switch is `npm run cancel-all`
-  assets: [BTC]
+  # === Asset switch 2026-05-28 (microstructure) ===
+  # DROPPED BTC. Tape (17.5h): BTC median spread 1c with ~2000sh competing depth
+  # = ~2.5% reward share and no maker edge (a 1c-spread market can't support a
+  # tradeable half_spread). BNB (~7c spread, ~210sh) and DOGE (~6c, ~270sh) give
+  # 6-7x more spread and ~8x less competition (~16-19% reward share). This is the
+  # single highest-EV change. NOTE: not yet validated for two-leg fill-rate/PnL —
+  # run with eyes on the first session; the session/net-worth halts below are the
+  # backstop. adverse_guard is BTC-tuned; alts are more volatile (watch fill rate).
+  # === Single-asset test mode 2026-05-28 ===
+  # Limited to ONE asset (BNB) for the validation phase: halves concurrent capital
+  # at risk, gives clean attribution, and the global caps below now bound a single
+  # market. BNB chosen over DOGE: widest tape spread (7c vs 6c) + lowest competing
+  # depth (~210 vs ~270 sh) = best per-fill maker edge. Add DOGE back once a
+  # session proves out. Two assets is NOT required — it only diversifies variance,
+  # and BNB/DOGE are correlated (both crypto) so the benefit is small.
+  # === Breadth for the rebate farm (2026-05-29) ===
+  # Was [DOGE] single-asset. The rebate (0.61% of notional) is variance-dominated
+  # at low volume; more INDEPENDENT 5m markets cut the variance of the average
+  # (∝1/√N) so the rebate edge emerges faster — at the SAME bounded capital (the
+  # max_deployed_usd cap below is a global cross-asset sum, NOT per-asset). Assets
+  # chosen by book width + competition (see half_spread_by_asset): BNB/DOGE (6c),
+  # XRP (3c, lowest competition), SOL (2c, filled best in backtest). ETH/BTC
+  # excluded — 1c books are untradeable for a small maker.
+  assets: [XRP]
   max_deployed_usd: 18     # ↑ from 6 — matches max_spend (4+4) + small inventory headroom
   # Loss caps KEPT TIGHT — we want to detect any new leak with the on-chain
   # reconciler ASAP. Don't raise these until 12h of clean operation.
   daily_loss_halt_usd: 2  # idle until 00:00 UTC after $2 realized loss
   session_loss_halt_usd: 10  # EXIT process after $3 cumulative realized loss since start
-  poll_interval_ms: 1500
+  poll_interval_ms: 750     # ↓ from 1500 (2× faster ticks; HTTP calls now batched/parallel so total latency fits)
   # === Reconcile cadence tightened 2026-05-28 ===
   # Overnight the /activity fill feed double-counted fills (unstable trade ids),
   # letting tracked inventory drift to ~71 vs 38 on-chain before the reconcile
   # corrected it. In that window the hedge/spend caps acted on garbage and
   # positions grew to 30-40 shares (8x the 5-share cap). 10s shrinks the drift
   # window 3x; the deriveTradeId fix removes the double-count at source.
-  reconcile_every_sec: 10   # on-chain position drift check cadence (0 disables)
+  reconcile_every_sec: 8   # on-chain position drift check cadence (0 disables)
   reconcile_correct: true   # snap tracked shares to on-chain truth on drift (false = log-only)
   # Cash-floor circuit breaker (2026-05-28). Winners auto-redeem at the account
   # level, so a falling balance is REAL losses, not locked capital. Overnight the
@@ -108,3 +183,8 @@ live:
   # set WIDER than session_loss_halt so the mark-based halts trip first in normal
   # operation; this only fires if the internal accounting is lying.
   net_worth_halt_usd: 15
+  # ── Session stop limits ────────────────────────────────────────────────────
+  # All three pause until 00:00 UTC (same as daily_loss_halt). 0 = disabled.
+  session_max_windows: 0         # stop after N resolved windows (0 = no limit)
+  session_take_profit_usd: 0     # lock in gains when session profit >= this (0 = disabled)
+  session_max_consec_losses: 3   # pause after 3 consecutive losing windows (0 = disabled)

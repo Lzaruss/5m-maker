@@ -13,6 +13,14 @@ export interface AdverseGuardConfig {
 
 export interface MakerConfig {
   halfSpread: number;
+  /** Per-asset half_spread override. The rule (microstructure study + two-leg
+   *  backtest 2026-05-29): half_spread must be ≈0.5× the asset's BOOK spread or
+   *  the bid sits behind the touch and only fills adversely. Tape medians differ
+   *  by asset (BNB/DOGE ~6¢ → 0.03; XRP ~3¢ → 0.015; SOL ~2¢ → 0.01), so a single
+   *  global half_spread can't be competitive on more than one. Assets not listed
+   *  fall back to `halfSpread`. Enables multi-asset breadth (variance ∝1/√N at
+   *  globally-bounded capital) for the rebate farm. */
+  halfSpreadByAsset?: Record<string, number>;
   quoteSizeUsd: number;
   /** Polymarket binary markets enforce a per-market `min_order_size` (typically
    *  5 shares for crypto 5m markets). At extreme prices `quoteSizeUsd / price`
@@ -54,6 +62,47 @@ export interface MakerConfig {
    *  enough" to the desired price (no cancel/replace) if within this many
    *  ticks. Larger value = less churn = fewer cancel-fill races. */
   replaceDeadbandTicks: number;
+  // ── Tier-2 entry/regime gates (2026-05-28) ───────────────────────────────
+  // All suppress OPENING new directional risk in low-edge/toxic conditions but
+  // never block risk-reducing actions (hedge-completion BUYs keep their price
+  // exception; the unwind SELL/ask is untouched). 0 disables each gate.
+  /** No-trade dead zone around 0.50: when |mid-0.5| < this, suppress the
+   *  opening BUY (a coinflip window has ~0 maker edge — pair cost ≈ 1). Hedge-
+   *  completion BUYs are exempt. The 50¢ zone is also where implicit fee/
+   *  structure cost is highest. */
+  noTradeBand50: number;
+  /** Stop OPENING new positions once timeToResolve <= this (seconds). Late
+   *  entries are adversely selected (price discovery near resolution; late buys
+   *  won 0-17% vs ~40% baseline). Hedge-completion BUYs and unwind SELLs still
+   *  allowed; > flattenBeforeSec so there's a window where we only de-risk. */
+  noNewEntryBeforeSec: number;
+  /** Hard volatility pause: when |assetReturn30s| >= this, emit no_quote on BOTH
+   *  sides so the reconciler cancels resting orders and the bot stands aside in
+   *  a violent move (can't make markets while the underlying repences). Set
+   *  ABOVE adverse_guard.pull (which only pulls one side). */
+  volHaltReturn30s: number;
+  /** Minimum top-of-book depth (shares) required on BOTH sides to quote. Thin/
+   *  one-sided books gap on a single market order and pick off resting quotes.
+   *  Only enforced when the caller supplies bid/ask depth. */
+  minBookDepthShares: number;
+  /** Peg quotes to the touch so they actually FILL. Without this, a bid at
+   *  mid-half_spread sits BEHIND the best bid whenever half_spread exceeds the
+   *  book's own half-spread (the BTC 1¢-book case) → it only fills on adverse
+   *  moves, and matched pairs almost never complete (live: 6% both-leg fill).
+   *  When true we never quote worse than the touch: bid = max(computed, bestBid),
+   *  ask = min(computed, bestAsk). Captures the book's spread, not a wider
+   *  synthetic one, but actually gets hit. NOTE: more fills realize the existing
+   *  (~0 on BTC) edge with MORE adverse-selection exposure — validate in the
+   *  simulator before trusting it live. */
+  pegToTouch: boolean;
+  /** Minimum guaranteed profit (in USD) per matched YES+NO pair before the
+   *  hedge-BUY ceiling allows completing the pair. Ensures every filled matched
+   *  pair settles above its combined cost ("even money or better"):
+   *    hedgeCeiling = 1.0 - otherLegAvgCost - minPairProfitPerShare
+   *  At 0.02 the bot requires at least 2 cents of locked-in profit per pair;
+   *  the matched pair must cost <= $0.98 to be accepted. Set to 0 to revert to
+   *  the old fixed HEDGE_BUY_PRICE_CEILING behaviour. */
+  minPairProfitPerShare: number;
   /** Simulator only: fraction of a crossing trade's size we assume to capture
    *  (queue-position proxy). 1.0 = front-of-line on the whole print. */
   fillParticipation: number;
@@ -103,6 +152,17 @@ export interface LiveConfig {
    *  (and adjusts cash at cost basis). When false, drift is only LOGGED — useful
    *  for observe-only validation before trusting the correction. */
   reconcileCorrect: boolean;
+  // ── Session stop limits ─────────────────────────────────────────────────
+  /** Pause for the rest of the UTC day after this many resolved windows.
+   *  "Trade the morning, then rest." 0 = disabled. */
+  sessionMaxWindows: number;
+  /** Pause for the rest of the UTC day once cumulative session profit reaches
+   *  this amount. Locks in gains before variance erases them. 0 = disabled. */
+  sessionTakeProfitUsd: number;
+  /** Pause for the rest of the UTC day after this many CONSECUTIVE losing
+   *  windows. Signals a regime where the strategy is no longer working.
+   *  0 = disabled. */
+  sessionMaxConsecLosses: number;
 }
 
 export interface BotConfig {
@@ -123,8 +183,21 @@ export function parseBotYaml(raw: string): BotConfig {
   });
 
   const m = obj.maker ?? {};
+  // Per-asset half_spread overrides: { XRP: 0.015, SOL: 0.01 }. Keys uppercased;
+  // values must be finite positive numbers (a bad entry is ignored, not fatal).
+  let halfSpreadByAsset: Record<string, number> | undefined;
+  if (m.half_spread_by_asset && typeof m.half_spread_by_asset === 'object') {
+    halfSpreadByAsset = {};
+    for (const [k, v] of Object.entries(m.half_spread_by_asset)) {
+      const n = Number(v);
+      if (Number.isFinite(n) && n > 0) halfSpreadByAsset[String(k).toUpperCase()] = n;
+    }
+    if (Object.keys(halfSpreadByAsset).length === 0) halfSpreadByAsset = undefined;
+  }
+
   const maker: MakerConfig = {
     halfSpread: m.half_spread ?? 0.03,
+    halfSpreadByAsset,
     quoteSizeUsd: m.quote_size_usd ?? 3.0,
     minQuoteShares: m.min_quote_shares ?? 5.0,
     inventorySkewK: m.inventory_skew_k ?? 0.5,
@@ -144,6 +217,12 @@ export function parseBotYaml(raw: string): BotConfig {
     maxUnmatchedShares: m.max_unmatched_shares ?? 5,
     maxSpendPerLegUsd: m.max_spend_per_leg_usd ?? 5,
     replaceDeadbandTicks: m.replace_deadband_ticks ?? 3,
+    noTradeBand50: m.no_trade_band_50 ?? 0.04,
+    noNewEntryBeforeSec: m.no_new_entry_before_sec ?? 90,
+    volHaltReturn30s: m.vol_halt_return_30s ?? 0.0025,
+    minBookDepthShares: m.min_book_depth_shares ?? 20,
+    pegToTouch: m.peg_to_touch === true,
+    minPairProfitPerShare: m.min_pair_profit_per_share ?? 0.02,
     fillParticipation: m.fill_participation ?? 1.0,
     // Accept new key `taker_fee_rate` (0.07) or fall back to the legacy
     // `taker_fee_max` if an old bot.yml is still in use.
@@ -176,6 +255,9 @@ export function parseBotYaml(raw: string): BotConfig {
     reconcileCorrect: lv.reconcile_correct ?? true,
     cashFloorUsd: lv.cash_floor_usd ?? 0,
     netWorthHaltUsd: lv.net_worth_halt_usd ?? 0,
+    sessionMaxWindows: lv.session_max_windows ?? 0,
+    sessionTakeProfitUsd: lv.session_take_profit_usd ?? 0,
+    sessionMaxConsecLosses: lv.session_max_consec_losses ?? 0,
   };
   return { assets, maker, risk, live };
 }

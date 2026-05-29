@@ -304,11 +304,26 @@ export async function fetchResolution(
     }
     if (!Array.isArray(prices) || prices.length < 2) return null;
 
-    const upPrice = Number(prices[0]);
-    const downPrice = Number(prices[1]);
+    // Determine which index in outcomePrices corresponds to the YES (Up) token.
+    // We CANNOT assume index 0 is always YES — verify against clobTokenIds so
+    // that a market returned by Gamma where the queried token sits at index 1
+    // doesn't silently produce an inverted yesWon result.
+    const tokenIds = parseTokenIds(m.clobTokenIds);
+    const yesIdx = tokenIds.findIndex((t) => t === yesTokenId);
+    // If the queried token isn't found in this market's token list, bail out.
+    // Fall back to index 0 only when Gamma omits clobTokenIds entirely.
+    const effectiveYesIdx = yesIdx >= 0 ? yesIdx : 0;
+    const noIdx = 1 - effectiveYesIdx; // the other outcome is always the opposite index
+
+    const upPrice = Number(prices[effectiveYesIdx]);
+    const downPrice = Number(prices[noIdx]);
     if (!Number.isFinite(upPrice) || !Number.isFinite(downPrice)) return null;
     if (Math.max(upPrice, downPrice) < decisiveThreshold) return null; // not settled yet
 
+    logger.debug(
+      { yesIdx: effectiveYesIdx, upPrice, downPrice, yesTokenId: yesTokenId.slice(0, 10) },
+      'fetchResolution decisive',
+    );
     return { yesWon: upPrice > downPrice, upPrice };
   } catch (err: any) {
     logger.debug({ error: err.message, yesTokenId }, 'fetchResolution failed');

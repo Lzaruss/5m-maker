@@ -66,7 +66,7 @@ import {
   isSellBalanceRejected,
   clearSellBalanceRejected,
 } from './clob/orders.js';
-import { fetchOurTrades } from './clob/trades.js';
+import { fetchOurTrades, fetchAllOurTrades } from './clob/trades.js';
 import { logEvent, closeLog } from './persistence/eventLog.js';
 import { createBot } from './telegram/bot.js';
 import { registerCommands } from './telegram/commands.js';
@@ -279,6 +279,7 @@ async function main(): Promise<void> {
   let windowsCount = 0;
   let winningWindows = 0;
   let losingWindows = 0;
+  let consecLosses = 0; // consecutive losing windows (reset to 0 on any win or break-even)
   const SUMMARY_INTERVAL_MS = 5 * 60_000;
   // Net-worth reality check runs faster than the summary so the on-chain
   // drawdown halt reacts quickly; the Telegram PUSH is still throttled to the
@@ -292,6 +293,12 @@ async function main(): Promise<void> {
   // concurrently; they share PnL counters, halt state, and the deployed-capital
   // cap via closure over the shared variables above.
   const runAsset = async (ASSET: Asset): Promise<void> => {
+    // Effective maker config for THIS asset: apply any per-asset half_spread
+    // override (a 6¢-book value sits behind a 3¢ book's touch → adverse). Only
+    // half_spread varies by asset; everything else is shared.
+    const assetHalfSpread = cfg.maker.halfSpreadByAsset?.[ASSET];
+    const makerCfg =
+      assetHalfSpread != null ? { ...cfg.maker, halfSpread: assetHalfSpread } : cfg.maker;
     // Per-asset isolation: each loop owns its book state and market feed so
     // that one asset's window cycle (setAssets / setAssets([])) never disrupts
     // the other asset's live subscription.
@@ -375,6 +382,18 @@ async function main(): Promise<void> {
       },
       'window open',
     );
+
+    // Snapshot the on-chain wallet at window open so the window-result
+    // notification can cross-check the mark-based windowPnl against reality.
+    // Best-effort: if this call fails, the notification just omits the wallet
+    // delta and we still get the mark-only message.
+    let windowOpenNetWorthUsd: number | null = null;
+    try {
+      const snap = await getAccountValue();
+      windowOpenNetWorthUsd = snap.netWorthUsd;
+    } catch {
+      // non-fatal — wallet cross-check will be skipped for this window
+    }
 
     // Reset per-window book + last-mid state and subscribe to BOTH outcome tokens.
     for (const leg of legs) {
@@ -504,33 +523,37 @@ async function main(): Promise<void> {
         }
       }
 
-      // 1. Pull fills for each leg independently. We do NOT advance sinceMs
-      //    based on individual fills — that previously dropped late-arriving
-      //    fills permanently and led to the 2026-05-27 -$47 stuck-positions
-      //    leak. Dedup is the responsibility of `leg.account.seen`.
-      for (const leg of legs) {
-        const trades = await fetchOurTrades(leg.tokenId, leg.sinceMs);
-        for (const t of trades) {
-          if (leg.account.seen.has(t.id)) continue;
-          leg.account = applyTrade(leg.account, t);
-          // Track filled BUY notional against the per-leg spend cap (filled-only
-          // semantics — cancel+replace cycles no longer eat budget).
-          if (t.side === 'BUY') {
-            leg.buyNotionalFilled += t.price * t.shares;
-            leg.buyShares += t.shares;
-          } else {
-            leg.sellShares += t.shares;
-            leg.sellNotional += t.price * t.shares;
+      // 1. Pull fills for ALL legs in ONE HTTP round-trip. The data-api
+      //    /activity endpoint returns all user activity regardless of token, so
+      //    calling it once and splitting by tokenId is strictly equivalent to
+      //    calling it N times sequentially — but N× faster.
+      {
+        const sinceMs = Math.min(...legs.map((l) => l.sinceMs));
+        const allTrades = await fetchAllOurTrades(legs.map((l) => l.tokenId), sinceMs);
+        for (const leg of legs) {
+          const trades = allTrades.get(leg.tokenId) ?? [];
+          for (const t of trades) {
+            if (leg.account.seen.has(t.id)) continue;
+            leg.account = applyTrade(leg.account, t);
+            // Track filled BUY notional against the per-leg spend cap (filled-only
+            // semantics — cancel+replace cycles no longer eat budget).
+            if (t.side === 'BUY') {
+              leg.buyNotionalFilled += t.price * t.shares;
+              leg.buyShares += t.shares;
+            } else {
+              leg.sellShares += t.shares;
+              leg.sellNotional += t.price * t.shares;
+            }
+            logEvent({
+              kind: 'fill',
+              token: leg.tokenId,
+              leg: leg.label,
+              id: t.id,
+              side: t.side,
+              price: t.price,
+              shares: t.shares,
+            });
           }
-          logEvent({
-            kind: 'fill',
-            token: leg.tokenId,
-            leg: leg.label,
-            id: t.id,
-            side: t.side,
-            price: t.price,
-            shares: t.shares,
-          });
         }
       }
 
@@ -656,10 +679,13 @@ async function main(): Promise<void> {
       //    on the strategy mode: classic mode flattens; BUY-only / hold-to-
       //    resolution mode (disable_sell) lets the residual ride to settlement.
       if (timeToResolveSec <= cfg.maker.flattenBeforeSec) {
-        for (const leg of legs) {
+        // Fetch open orders for ALL legs in parallel before iterating.
+        const flattenOpenOrders = await Promise.all(legs.map((l) => listOpenOrders(l.tokenId)));
+        for (let li = 0; li < legs.length; li++) {
+          const leg = legs[li];
           const mid = legMids[leg.tokenId];
           if (!(mid > 0)) continue;
-          const open = await listOpenOrders(leg.tokenId);
+          const open = flattenOpenOrders[li];
           if (open.length > 0) {
             logEvent({ kind: 'flatten_cancel', token: leg.tokenId, leg: leg.label, ids: open.map((o) => o.id) });
             if (enabled) await cancelByIds(open.map((o) => o.id));
@@ -684,15 +710,24 @@ async function main(): Promise<void> {
             });
             leg.flattened = false;
           }
-          const invUsd = leg.account.shares * mid;
-          if (Math.abs(invUsd) > cfg.maker.flattenIfNetAboveUsd && !leg.flattened) {
+          // DELTA-NEUTRAL CLOSE (2026-05-28): flatten ONLY the unmatched excess
+          // over the matched pair, never the matched core. The matched portion
+          // (min of the two legs) redeems for a guaranteed $1 — market-selling
+          // it as a taker would break the hedge AND pay a fee to exit something
+          // worth $1. Only the naked excess (this leg minus its partner) carries
+          // directional risk worth capping at the boundary.
+          const otherFlattenLeg = legs.find((l) => l.tokenId !== leg.tokenId);
+          const otherFlattenShares = otherFlattenLeg?.account.shares ?? 0;
+          const unmatchedShares = Math.max(0, leg.account.shares - otherFlattenShares);
+          const invUsd = unmatchedShares * mid;
+          if (invUsd > cfg.maker.flattenIfNetAboveUsd && !leg.flattened) {
             // `mid` may have come from lastMids while the CURRENT book is empty
             // on the side we'd cross. Skip the flatten this tick if so — we'll
             // retry next tick when the book recovers. SAFER than market-crossing
             // with no real reference price.
             const book = books.get(leg.tokenId);
-            const side: 'BUY' | 'SELL' = leg.account.shares > 0 ? 'SELL' : 'BUY';
-            const touchSide = side === 'BUY' ? book?.asks : book?.bids;
+            const side: 'BUY' | 'SELL' = 'SELL'; // long-only: excess is always sold
+            const touchSide = book?.bids;
             if (!touchSide || touchSide.length === 0) {
               logEvent({
                 kind: 'flatten_skip', token: leg.tokenId, leg: leg.label, side, invUsd,
@@ -700,13 +735,13 @@ async function main(): Promise<void> {
               });
               continue;
             }
-            const shares = Math.abs(leg.account.shares);
+            const shares = unmatchedShares;
             const refPrice = touchSide[0].price;
             logEvent({
               kind: 'flatten', token: leg.tokenId, leg: leg.label, side, shares, refPrice, invUsd,
               attempt: leg.flattenAttempts + 1,
             });
-            logger.warn({ leg: leg.label, side, shares, refPrice, invUsd, attempt: leg.flattenAttempts + 1 }, 'flattening residual inventory');
+            logger.warn({ leg: leg.label, side, shares, refPrice, invUsd, attempt: leg.flattenAttempts + 1 }, 'flattening unmatched excess inventory');
             // Mark as flattened BEFORE the call. If the FOK is rejected we do
             // NOT retry next tick (the 54-FOK incident) — the re-arm above is
             // the only path to a retry, gated by share-count change AND
@@ -736,11 +771,17 @@ async function main(): Promise<void> {
       if (state.paused) continue;
       const openByToken: Record<string, LiveOrder[]> = {};
       let thisAssetDeployed = 0;
-      for (const leg of legs) {
-        const open = await listOpenOrders(leg.tokenId);
-        openByToken[leg.tokenId] = open;
-        const mid = legMids[leg.tokenId];
-        thisAssetDeployed += openBuyNotional(open) + Math.abs(leg.account.shares) * mid;
+      // Fetch open orders for BOTH legs in parallel — two independent CLOB
+      // REST calls with no ordering dependency.
+      {
+        const openResults = await Promise.all(legs.map((l) => listOpenOrders(l.tokenId)));
+        for (let li = 0; li < legs.length; li++) {
+          const leg = legs[li];
+          const open = openResults[li];
+          openByToken[leg.tokenId] = open;
+          const mid = legMids[leg.tokenId];
+          thisAssetDeployed += openBuyNotional(open) + Math.abs(leg.account.shares) * mid;
+        }
       }
       // Register this asset's contribution and derive the global deployed total
       // across all concurrent asset loops (cross-asset cap enforcement).
@@ -801,6 +842,17 @@ async function main(): Promise<void> {
         const otherLegShares = otherLeg?.account.shares ?? 0;
         const sharesDiff = leg.account.shares - otherLegShares;
 
+        // Volume-weighted average cost of the OTHER leg's current holdings.
+        // Used by the quoter's dynamic hedge-BUY ceiling to guarantee that
+        // every completed matched pair settles above its combined cost:
+        //   hedgeCeiling = 1 - otherLegAvgCost - minPairProfitPerShare
+        // This prevents the fixed-ceiling bug where pair cost could exceed $1
+        // (locked-in loss) when the market moved after the first leg filled.
+        const otherLegAvgCost =
+          otherLeg && otherLeg.account.shares > 0.5
+            ? -otherLeg.account.cashUsd / otherLeg.account.shares
+            : undefined;
+
         const decision = computeQuotes(
           {
             bestBid,
@@ -809,13 +861,19 @@ async function main(): Promise<void> {
             inventoryUsd,
             btcReturn30s: priceReturn30s,
             timeToResolveSec,
+            // Top-of-book depth for the min-depth gate (don't quote into a thin book).
+            bidDepthShares: book.bids[0]?.size,
+            askDepthShares: book.asks[0]?.size,
             // 3A: lets the quoter relax maxBuyPrice when the other leg is heavier
             // (each share we BUY here hedges one share of the other leg's
             // directional exposure, so per-share R/R no longer matters for the
             // matched portion).
             otherLegShares,
+            // Even-money guarantee: the quoter uses this to cap the hedge-BUY
+            // price so the completed pair always has positive locked profit.
+            otherLegAvgCost,
           },
-          cfg.maker,
+          makerCfg,
         );
 
         // Hedge cap: don't add to the over-represented leg. Once `legShares -
@@ -846,6 +904,7 @@ async function main(): Promise<void> {
           bestBid,
           bestAsk,
           legShares: leg.account.shares,
+          otherLegShares,
           hedgeBlocksBuy: hedgeBlock,
           spendBlocksBuy: spendBlock,
           disableSell: cfg.maker.disableSell || isSellBalanceRejected(leg.tokenId),
@@ -936,12 +995,12 @@ async function main(): Promise<void> {
     }
 
     // FINAL SWEEP: pull fills one last time for each leg before computing
-    // legPnl. /activity has up to ~20s lag, so fills that filled in the last
-    // 30s of the window may not have been visible during the inner loop. With
-    // sinceMs frozen at window_open-60s and the seen-set dedup, this sweep
-    // is safe to call repeatedly and only adds what we missed.
-    for (const leg of legs) {
-      const lateTrades = await fetchOurTrades(leg.tokenId, leg.sinceMs);
+    // legPnl. One batch call covers all legs in a single round-trip.
+    {
+      const sinceMs = Math.min(...legs.map((l) => l.sinceMs));
+      const lateBatch = await fetchAllOurTrades(legs.map((l) => l.tokenId), sinceMs);
+      for (const leg of legs) {
+        const lateTrades = lateBatch.get(leg.tokenId) ?? [];
       let lateCount = 0;
       for (const t of lateTrades) {
         if (leg.account.seen.has(t.id)) continue;
@@ -968,6 +1027,7 @@ async function main(): Promise<void> {
       if (lateCount > 0) {
         logEvent({ kind: 'final_sweep', token: leg.tokenId, leg: leg.label, lateCount, sharesAfter: leg.account.shares });
       }
+      }
     }
 
     // Settle the window per leg. YES settles to 1 if yesWon, NO settles to the
@@ -987,13 +1047,42 @@ async function main(): Promise<void> {
       // to e.g. [0.83, 0.17] before fully converging to [0.995, 0.005].
       const RESOLVE_RETRIES = 15;
       const RESOLVE_POLL_MS = 3_000;
+      // Require two CONSECUTIVE decisive reads with the same yesWon direction
+      // before accepting the resolution. This guards against the common case
+      // where Gamma's outcomePrices transiently shows the wrong side winning
+      // (e.g. [0.18, 0.82]) in the first second after close, only to correct
+      // to [0, 1] one poll later. A single unconfirmed decisive read caused the
+      // "+$4.35 (mark) | NO (Down)" false-win notification.
+      let prevRes: Awaited<ReturnType<typeof fetchResolution>> = null;
       for (let attempt = 0; attempt <= RESOLVE_RETRIES; attempt++) {
-        res = await fetchResolution(market.yesTokenId, 0.80);
-        if (res) break;
+        const r = await fetchResolution(market.yesTokenId, 0.80);
+        if (r) {
+          if (prevRes !== null && r.yesWon === prevRes.yesWon) {
+            // Confirmed: same direction twice in a row → trust it.
+            res = r;
+            break;
+          }
+          // First decisive read (or direction flip) — store but keep polling.
+          prevRes = r;
+        } else {
+          prevRes = null; // reset confirmation if market becomes indecisive again
+        }
         if (attempt < RESOLVE_RETRIES) {
-          logger.debug({ attempt: attempt + 1, yesTokenId: market.yesTokenId.slice(0, 10) }, 'fetchResolution not decisive yet — retrying');
+          logger.debug(
+            { attempt: attempt + 1, prevYesWon: prevRes?.yesWon, yesTokenId: market.yesTokenId.slice(0, 10) },
+            'fetchResolution not confirmed yet — retrying',
+          );
           await sleep(RESOLVE_POLL_MS);
         }
+      }
+      // If we ran out of retries without two matching reads, use the last
+      // single decisive result (if any) rather than falling back to 0.5.
+      if (!res && prevRes) {
+        logger.warn(
+          { yesWon: prevRes.yesWon, yesTokenId: market.yesTokenId.slice(0, 10) },
+          'fetchResolution not confirmed after retries — using unconfirmed result',
+        );
+        res = prevRes;
       }
       if (!res) {
         logger.warn({ yesTokenId: market.yesTokenId.slice(0, 10) }, 'fetchResolution still unresolved after retries — using 0.5 fallback');
@@ -1041,8 +1130,9 @@ async function main(): Promise<void> {
       realizedTodayUsd += windowPnl;
       realizedSessionUsd += windowPnl;
       windowsCount++;
-      if (windowPnl > 0) winningWindows++;
-      else if (windowPnl < 0) losingWindows++;
+      if (windowPnl > 0) { winningWindows++; consecLosses = 0; }
+      else if (windowPnl < 0) { losingWindows++; consecLosses++; }
+      else { consecLosses = 0; } // break-even resets the streak
     } else {
       unresolvedDeferredUsd += windowPnl;
       logEvent({
@@ -1076,10 +1166,47 @@ async function main(): Promise<void> {
     };
     // Push notable windows to Telegram (skip the noise of zero-PnL windows).
     if (Math.abs(windowPnl) >= 0.01) {
-      void notifier.windowResult(windowPnl, realizedTodayUsd, res ? res.yesWon : null);
+      // Best-effort: fetch the current wallet to cross-check the mark-based
+      // windowPnl against on-chain reality. A wrong resolution (Gamma showing
+      // the wrong winner transiently) shows up immediately as a mark/wallet gap.
+      let walletWindowDelta: number | null = null;
+      if (windowOpenNetWorthUsd !== null) {
+        try {
+          const snapClose = await getAccountValue();
+          walletWindowDelta = snapClose.netWorthUsd - windowOpenNetWorthUsd;
+        } catch {
+          // non-fatal — notification still works without the wallet cross-check
+        }
+      }
+      void notifier.windowResult(windowPnl, realizedTodayUsd, res ? res.yesWon : null, walletWindowDelta);
     }
 
     marketFeed.setAssets([]);
+
+    // ── Session stop limits (checked after every resolved window) ──────────────
+    // All three use the daily-halt mechanism (idle until 00:00 UTC, auto-resume)
+    // rather than the hard session-halt (exit process).
+    if (res) {
+      if (cfg.live.sessionTakeProfitUsd > 0 && realizedSessionUsd >= cfg.live.sessionTakeProfitUsd) {
+        logEvent({ kind: 'take_profit_halt', realizedSessionUsd, threshold: cfg.live.sessionTakeProfitUsd });
+        logger.info({ realizedSessionUsd, threshold: cfg.live.sessionTakeProfitUsd }, 'TAKE-PROFIT STOP — pausing until UTC midnight');
+        void notifier.takeProfitHalt(realizedSessionUsd, cfg.live.sessionTakeProfitUsd);
+        halted = true;
+        haltUntilMs = nextUtcMidnightMs();
+      } else if (cfg.live.sessionMaxWindows > 0 && windowsCount >= cfg.live.sessionMaxWindows) {
+        logEvent({ kind: 'max_windows_halt', windowsCount, limit: cfg.live.sessionMaxWindows, realizedSessionUsd });
+        logger.info({ windowsCount, limit: cfg.live.sessionMaxWindows }, 'MAX-WINDOWS STOP — pausing until UTC midnight');
+        void notifier.maxWindowsHalt(windowsCount, realizedSessionUsd);
+        halted = true;
+        haltUntilMs = nextUtcMidnightMs();
+      } else if (cfg.live.sessionMaxConsecLosses > 0 && consecLosses >= cfg.live.sessionMaxConsecLosses) {
+        logEvent({ kind: 'consec_losses_halt', consecLosses, limit: cfg.live.sessionMaxConsecLosses, realizedSessionUsd });
+        logger.warn({ consecLosses, limit: cfg.live.sessionMaxConsecLosses }, 'CONSECUTIVE-LOSSES STOP — pausing until UTC midnight');
+        void notifier.maxConsecLossesHalt(consecLosses, realizedSessionUsd);
+        halted = true;
+        haltUntilMs = nextUtcMidnightMs();
+      }
+    }
 
     // HARD session-loss check after every window settlement. Unlike the daily
     // halt which idles until UTC midnight, this one EXITS the process — the

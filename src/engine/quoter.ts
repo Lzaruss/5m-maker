@@ -18,6 +18,17 @@ export interface QuoteInput {
    *  exposure into a matched pair, which is risk-reducing even at p>0.5. Default
    *  0 keeps the original "underdog only" behavior. */
   otherLegShares?: number;
+  /** Top-of-book resting size (shares) on each side. Used by the min-depth gate.
+   *  Omit to disable that gate (e.g. the single-token simulator). */
+  bidDepthShares?: number;
+  askDepthShares?: number;
+  /** Volume-weighted average cost of the shares held on the OTHER leg (i.e.
+   *  -cashUsd / shares for that account). When supplied, the hedge-BUY ceiling
+   *  is tightened to `1 - otherLegAvgCost - cfg.minPairProfitPerShare` so that
+   *  every completed matched pair is guaranteed to settle above its cost
+   *  ("even money or better"). Without this, the fixed HEDGE_BUY_PRICE_CEILING
+   *  can produce pairs whose combined cost > $1 → locked-in loss. */
+  otherLegAvgCost?: number;
 }
 
 export interface QuoteSidePlan {
@@ -35,10 +46,9 @@ export type QuoteDecision =
 const VENUE_PRICE_MIN = 0.01;
 const VENUE_PRICE_MAX = 0.99;
 
-// Hedge-BUY ceiling: when the other leg has more shares than this one, we
-// permit BUYs above maxBuyPrice up to this price. The matched portion reduces
-// directional risk, but we still cap below extreme prices where rounding and
-// fees dominate the spread.
+// Hedge-BUY hard ceiling: absolute maximum we ever pay for the hedge leg,
+// regardless of the dynamic pair-profit calculation. Prevents buying into
+// extreme prices even when the other-leg cost is very low.
 const HEDGE_BUY_PRICE_CEILING = 0.85;
 
 /**
@@ -66,6 +76,25 @@ export function computeQuotes(input: QuoteInput, cfg: MakerConfig): QuoteDecisio
   }
   const mid = (bestBid + bestAsk) / 2;
 
+  // Tier-2 GATE — volatility hard-pause. A 30s move this large means the whole
+  // book is repricing; stand aside on BOTH sides so the reconciler cancels our
+  // resting quotes rather than feeding them to informed flow. Stronger than the
+  // adverse_guard below (which only pulls one side).
+  if (cfg.volHaltReturn30s > 0 && Math.abs(btcReturn30s ?? 0) >= cfg.volHaltReturn30s) {
+    return { action: 'no_quote', reason: 'vol_regime_halt' };
+  }
+  // Tier-2 GATE — minimum two-sided depth. A thin/one-sided book gaps on a
+  // single market order and picks off resting quotes. Only enforced when the
+  // caller supplies depth (the single-token simulator omits it).
+  if (
+    cfg.minBookDepthShares > 0 &&
+    input.bidDepthShares !== undefined &&
+    input.askDepthShares !== undefined &&
+    (input.bidDepthShares < cfg.minBookDepthShares || input.askDepthShares < cfg.minBookDepthShares)
+  ) {
+    return { action: 'no_quote', reason: 'thin_book' };
+  }
+
   // 2. Inventory skew. invFrac in [-1, 1]; long YES (positive) shifts the
   //    reservation price DOWN so the ask is keener (we sell) and the bid is
   //    less aggressive (we stop accumulating).
@@ -92,6 +121,16 @@ export function computeQuotes(input: QuoteInput, cfg: MakerConfig): QuoteDecisio
   if (inventoryUsd >= cfg.maxInventoryUsd) bidPrice = null; // too long, stop buying
   if (inventoryUsd <= -cfg.maxInventoryUsd) askPrice = null; // too short, stop selling
 
+  // 4b. PEG TO TOUCH (fill-rate fix). Never quote worse than the touch: a bid
+  //     behind the best bid (when half_spread > the book's half-spread) only
+  //     fills on adverse moves and almost never completes a matched pair. Join
+  //     the touch so we actually get hit. maxBuyPrice / dead-zone / late gates
+  //     below still apply to the pegged price.
+  if (cfg.pegToTouch) {
+    if (bidPrice !== null) bidPrice = Math.max(bidPrice, bestBid);
+    if (askPrice !== null) askPrice = Math.min(askPrice, bestAsk);
+  }
+
   // Round to tick and clamp to a valid price range.
   const bid = finalizeSide(bidPrice, cfg, 'down');
   const ask = finalizeSide(askPrice, cfg, 'up');
@@ -110,27 +149,61 @@ export function computeQuotes(input: QuoteInput, cfg: MakerConfig): QuoteDecisio
   // base maxBuyPrice rule re-applies.
   const otherLegShares = input.otherLegShares ?? 0;
   const hedgeRoom = Math.max(0, otherLegShares - input.inventoryShares);
-  const effectiveMaxBuyPrice = hedgeRoom > 0 ? HEDGE_BUY_PRICE_CEILING : cfg.maxBuyPrice;
+
+  // Dynamic hedge-BUY ceiling: cap at the price that guarantees the completed
+  // pair settles above its total cost ("even money or better").
+  //   ceiling = 1.0 - otherLegAvgCost - minPairProfitPerShare
+  // If the other leg's average cost is unknown (first tick, no fills yet),
+  // fall back to the hard HEDGE_BUY_PRICE_CEILING so the hedge is still
+  // possible but conservatively bounded.
+  let dynamicHedgeCeiling = HEDGE_BUY_PRICE_CEILING;
+  if (hedgeRoom > 0 && input.otherLegAvgCost != null && input.otherLegAvgCost > 0) {
+    const minProfit = cfg.minPairProfitPerShare ?? 0.02;
+    dynamicHedgeCeiling = Math.min(
+      HEDGE_BUY_PRICE_CEILING,
+      1.0 - input.otherLegAvgCost - minProfit,
+    );
+  }
+
+  const effectiveMaxBuyPrice = hedgeRoom > 0 ? dynamicHedgeCeiling : cfg.maxBuyPrice;
   const finalBid = bid && bid.price <= effectiveMaxBuyPrice ? bid : null;
 
+  // Tier-2 GATEs that suppress OPENING a BUY in low-edge / late conditions. A
+  // hedge-completion BUY (hedgeRoom > 0) reduces directional risk, so it is
+  // EXEMPT — only a BUY that adds naked exposure is gated. The ask (unwind SELL)
+  // is never touched here.
+  let gatedBid = finalBid;
+  let gateReason = '';
+  const opening = hedgeRoom === 0;
+  if (gatedBid && opening && cfg.noTradeBand50 > 0 && Math.abs(mid - 0.5) < cfg.noTradeBand50) {
+    gatedBid = null;
+    gateReason = 'near_50_no_edge';
+  }
+  if (gatedBid && opening && cfg.noNewEntryBeforeSec > 0 && timeToResolveSec <= cfg.noNewEntryBeforeSec) {
+    gatedBid = null;
+    gateReason = 'late_no_entry';
+  }
+
   // If rounding crossed the quotes, drop both (book too tight for our spread).
-  if (finalBid && ask && finalBid.price >= ask.price) {
+  if (gatedBid && ask && gatedBid.price >= ask.price) {
     return { action: 'no_quote', reason: 'crossed_after_rounding' };
   }
-  if (!finalBid && !ask) {
+  if (!gatedBid && !ask) {
     return { action: 'no_quote', reason: 'both_sides_pulled' };
   }
 
   const reason =
-    bid && !finalBid
-      ? 'buy_above_max_price'
-      : absR >= cfg.adverseGuard.btcReturn30sPull
-        ? 'pulled_one_side'
-        : absR >= cfg.adverseGuard.btcReturn30sWiden
-          ? 'widened'
-          : 'normal';
+    gateReason
+      ? gateReason
+      : bid && !finalBid
+        ? 'buy_above_max_price'
+        : absR >= cfg.adverseGuard.btcReturn30sPull
+          ? 'pulled_one_side'
+          : absR >= cfg.adverseGuard.btcReturn30sWiden
+            ? 'widened'
+            : 'normal';
 
-  return { action: 'quote', bid: finalBid, ask, reason };
+  return { action: 'quote', bid: gatedBid, ask, reason };
 }
 
 function finalizeSide(

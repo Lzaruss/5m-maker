@@ -56,36 +56,62 @@ export function deriveTradeId(r: any, tsMs: number): string {
  */
 const SINCE_SLACK_MS = 5 * 60_000;
 
-export async function fetchOurTrades(tokenId: string, sinceMs: number): Promise<Trade[]> {
+/**
+ * Fetch activity from the data-api for the calling user and parse all TRADE
+ * events into Trade objects.  Shared by both the single-token and batch
+ * variants so the HTTP call is never duplicated within a tick.
+ */
+async function fetchActivityRaw(floorMs: number): Promise<{ arr: any[]; ok: boolean }> {
   const user = loadEnv().clobFunderAddress;
   try {
     const { data } = await axios.get(`${DATA_API}/activity`, {
       params: { user, limit: 200 },
-      timeout: 15000,
+      timeout: 8000,
     });
     const arr: any[] = Array.isArray(data) ? data : (data?.activity ?? data?.data ?? []);
-    const out: Trade[] = [];
-    const floorMs = sinceMs - SINCE_SLACK_MS;
-    for (const r of arr) {
-      if (String(r.type ?? '').toUpperCase() !== 'TRADE') continue;
-      const asset = String(r.asset ?? r.asset_id ?? r.tokenId ?? '');
-      if (asset !== tokenId) continue;
-      const tsMs = Number(r.timestamp ?? 0) > 1e12 ? Number(r.timestamp) : Number(r.timestamp ?? 0) * 1000;
-      // Floor instead of strict `<= sinceMs` — never drop a late fill while
-      // we're still potentially trading on this token. Dedup is handled by the
-      // caller's `account.seen` set.
-      if (tsMs < floorMs) continue;
-      out.push({
-        id: deriveTradeId(r, tsMs),
-        side: String(r.side).toUpperCase() === 'SELL' ? 'SELL' : 'BUY',
-        price: Number(r.price),
-        shares: Number(r.size),
-        tsMs,
-      });
-    }
-    return out;
+    return { arr, ok: true };
   } catch (err: any) {
-    logger.error({ err: err.message }, 'fetchOurTrades failed');
-    return [];
+    logger.error({ err: err.message }, 'fetchActivity failed');
+    return { arr: [], ok: false };
   }
+}
+
+function parseTrades(arr: any[], tokenSet: Set<string>, floorMs: number): Map<string, Trade[]> {
+  const result = new Map<string, Trade[]>();
+  for (const id of tokenSet) result.set(id, []);
+  for (const r of arr) {
+    if (String(r.type ?? '').toUpperCase() !== 'TRADE') continue;
+    const asset = String(r.asset ?? r.asset_id ?? r.tokenId ?? '');
+    if (!tokenSet.has(asset)) continue;
+    const tsMs = Number(r.timestamp ?? 0) > 1e12 ? Number(r.timestamp) : Number(r.timestamp ?? 0) * 1000;
+    if (tsMs < floorMs) continue;
+    result.get(asset)!.push({
+      id: deriveTradeId(r, tsMs),
+      side: String(r.side).toUpperCase() === 'SELL' ? 'SELL' : 'BUY',
+      price: Number(r.price),
+      shares: Number(r.size),
+      tsMs,
+    });
+  }
+  return result;
+}
+
+/**
+ * Batch variant: fetch activity ONCE and return trades grouped by tokenId.
+ * Use this instead of calling fetchOurTrades per-leg so the inner loop only
+ * makes one HTTP round-trip per tick regardless of how many legs there are.
+ */
+export async function fetchAllOurTrades(
+  tokenIds: string[],
+  sinceMs: number,
+): Promise<Map<string, Trade[]>> {
+  const floorMs = sinceMs - SINCE_SLACK_MS;
+  const { arr } = await fetchActivityRaw(floorMs);
+  return parseTrades(arr, new Set(tokenIds), floorMs);
+}
+
+export async function fetchOurTrades(tokenId: string, sinceMs: number): Promise<Trade[]> {
+  const floorMs = sinceMs - SINCE_SLACK_MS;
+  const { arr } = await fetchActivityRaw(floorMs);
+  return parseTrades(arr, new Set([tokenId]), floorMs).get(tokenId) ?? [];
 }
