@@ -11,9 +11,12 @@ export interface TelegramDeps {
 export function createBot(deps: TelegramDeps): TelegramBot | null {
   if (!deps.token || !deps.allowedChatId) return null;
   const bot = new TelegramBot(deps.token, { polling: true });
-  bot.on('polling_error', (err: any) =>
-    logger.warn({ err: err?.message }, 'telegram polling error'),
-  );
+  bot.on('polling_error', (err: any) => {
+    // 502/503 are transient Telegram gateway errors — suppress to avoid log noise
+    const code: string = String(err?.code ?? err?.message ?? '');
+    if (code.includes('502') || code.includes('503')) return;
+    logger.warn({ err: err?.message }, 'telegram polling error');
+  });
   return bot;
 }
 

@@ -156,14 +156,31 @@ export function computeQuotes(input: QuoteInput, cfg: MakerConfig): QuoteDecisio
   // If the other leg's average cost is unknown (first tick, no fills yet),
   // fall back to the hard HEDGE_BUY_PRICE_CEILING so the hedge is still
   // possible but conservatively bounded.
+  // A cost basis is "present but ~0" ONLY when the reconciler snapped on-chain
+  // shares before the venue indexed their cost (avgPrice=0), leaving the other leg
+  // with shares and cashUsd=0 → otherLegAvgCost = -0/shares = 0. That is corrupt
+  // data, not a real free position: using it gives ceiling = 1 - 0 - minProfit ≈
+  // 0.98 and lets us BUY the pair above its profitable price (the 2026-05-29 -$15
+  // episode). A genuine sub-cent cost basis is implausible in this market, so we
+  // treat anything below this floor as corrupt and refuse the hedge relaxation.
+  const minViableAvgCost = 0.02;
   let dynamicHedgeCeiling = HEDGE_BUY_PRICE_CEILING;
-  if (hedgeRoom > 0 && input.otherLegAvgCost != null && input.otherLegAvgCost > 0) {
-    const minProfit = cfg.minPairProfitPerShare ?? 0.02;
-    dynamicHedgeCeiling = Math.min(
-      HEDGE_BUY_PRICE_CEILING,
-      1.0 - input.otherLegAvgCost - minProfit,
-    );
+  if (hedgeRoom > 0 && input.otherLegAvgCost != null) {
+    if (input.otherLegAvgCost >= minViableAvgCost) {
+      const minProfit = cfg.minPairProfitPerShare ?? 0.02;
+      dynamicHedgeCeiling = Math.min(
+        HEDGE_BUY_PRICE_CEILING,
+        1.0 - input.otherLegAvgCost - minProfit,
+      );
+    } else {
+      // Corrupt (free-share) cost basis → no hedge relaxation. Fall back to the
+      // conservative cfg.maxBuyPrice instead of the 0.85 hard ceiling.
+      dynamicHedgeCeiling = cfg.maxBuyPrice;
+    }
   }
+  // Note: otherLegAvgCost == null (no fills indexed yet — only reachable when the
+  // other leg holds < 0.5 shares, so hedgeRoom is negligible) keeps the original
+  // HEDGE_BUY_PRICE_CEILING fallback: the hedge stays possible but bounded.
 
   const effectiveMaxBuyPrice = hedgeRoom > 0 ? dynamicHedgeCeiling : cfg.maxBuyPrice;
   const finalBid = bid && bid.price <= effectiveMaxBuyPrice ? bid : null;

@@ -169,3 +169,9 @@ live:
   # true  = snap tracked shares to on-chain value (corrects accounting).
   # false = log the discrepancy only (audit mode, no state change).
   reconcile_correct: true
+
+  # Debounce window for corrections (ms). A drift is only corrected after it has
+  # persisted continuously this long; shorter-lived drift is treated as a lagging
+  # /activity fill that self-closes when it lands, avoiding a snap-then-fill
+  # double-count. Keep above the worst-case fill lag (~60s).
+  reconcile_min_persist_ms: 60000

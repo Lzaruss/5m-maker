@@ -39,7 +39,12 @@ maker:
   min_quote_shares: 5.0        # Polymarket min_order_size floor
   inventory_skew_k: 0.2        # gentle skew — keeps SELL from going fire-sale
   widen_factor: 2.5            # widen on volatility
-  max_inventory_usd: 4       # slight bump from 2.0 — allow 1 fill of 5 sh
+  # Per-leg DOLLAR exposure cap (now enforced ON-CHAIN-AWARE, 2026-05-30). The
+  # gate suppresses ALL buys on a leg once its real holdings × mid reach this. 3.0
+  # ≈ one 5-share clip of headroom, bounding worst-case directional loss to ~$3/leg
+  # per window. Was 4 but enforced on lagged tracked shares, so a fill burst (4-30s
+  # /activity lag) ran a leg to 20 shares before it bit. Raise once pairs prove out.
+  max_inventory_usd: 3
   tick_size: 0.01              # price granularity for rounding quotes
 
   # ── Strategy mode ─────────────────────────────────────────────────────────
@@ -58,7 +63,12 @@ maker:
   # Restricting BUYs to the "underdog" side (price <= 0.5) keeps R/R >= 1:1
   # on every entry. Asymmetric — does NOT affect SELL placement.
   max_buy_price: 0.50          # never post BUY above this price (STRUCTURAL FIX, keep)
-  max_unmatched_shares: 3      # back to 5 (was 4) — allow 1 unmatched fill per side
+  # COHERENCE (2026-05-30): max_unmatched_shares MUST be >= min_quote_shares (5).
+  # The BUY clip can't be smaller than the venue's 5-share minimum, so a cap below
+  # 5 can never fit a single clip — the size-clamp then drops EVERY opening BUY and
+  # the bot places 0 orders (observed: 3 windows, 0 trades at cap=3). 5 = exactly
+  # one unmatched clip of directional exposure per leg (~$1.5-2.5 max loss/window).
+  max_unmatched_shares: 5
   max_spend_per_leg_usd: 8     # ↑ from 3 — was hitting cap in 30s and going idle
   # ↑ 3→4 (2026-05-28): 59-274 reconciles per fill in the logs. A wider deadband
   # cuts cancel+replace churn AND the cancel-fill races that let inventory drift
@@ -80,10 +90,13 @@ maker:
   # All suppress OPENING new directional risk in low-edge/toxic conditions but
   # never block de-risking (hedge-completion BUYs are exempt; the unwind SELL is
   # untouched). Set any to 0 to disable.
-  # No-trade dead zone around 0.50: coinflip windows have ~0 maker edge (pair
-  # cost ≈ 1) and the highest implicit fee/structure cost. 0.04 => skip opening
-  # BUYs when mid ∈ [0.46, 0.54]. Confirmed by data: near-50 pairs cost 0.93-0.99.
-  no_trade_band_50: 0.04
+  # No-trade dead zone around 0.50. DISABLED 2026-05-30: the new un-hedgeable
+  # opening guard restricts OPENING to exactly the near-50/50 zone (where BOTH legs
+  # are <= max_buy_price, so the pair can complete). This band blocked that same
+  # zone, so the two together left the bot unable to open at all. Near-50 is in fact
+  # where the maker EDGE lives: buying both legs at the BID gives pair cost
+  # 1 - 2*half_spread < 1 (the dead-zone comment confused mid-cost with bid-cost).
+  no_trade_band_50: 0
   # Stop OPENING inside the last 90s — late entries are adversely selected (late
   # buys won 0-17% vs ~40% baseline). Must be > flatten_before_sec (30) so there
   # is a de-risk-only window. Hedge-completion + unwind still run.
@@ -153,12 +166,16 @@ live:
   # chosen by book width + competition (see half_spread_by_asset): BNB/DOGE (6c),
   # XRP (3c, lowest competition), SOL (2c, filled best in backtest). ETH/BTC
   # excluded — 1c books are untradeable for a small maker.
-  assets: [XRP]
-  max_deployed_usd: 18     # ↑ from 6 — matches max_spend (4+4) + small inventory headroom
+  # Two assets for the validation run: XRP (lowest competition) + SOL (filled best
+  # in the two-leg backtest, 17%). Both have tuned half_spread_by_asset. Breadth
+  # gives enough matched-pair fills to actually VALIDATE the 2026-05-29/30 fixes,
+  # while max_deployed_usd below (a cross-asset SUM) keeps total capital bounded.
+  assets: [SOL]
+  max_deployed_usd: 18     # cross-asset SUM ≈ max_spend_per_leg (8) × 2 legs + headroom
   # Loss caps KEPT TIGHT — we want to detect any new leak with the on-chain
   # reconciler ASAP. Don't raise these until 12h of clean operation.
-  daily_loss_halt_usd: 2  # idle until 00:00 UTC after $2 realized loss
-  session_loss_halt_usd: 10  # EXIT process after $3 cumulative realized loss since start
+  daily_loss_halt_usd: 5  # idle until 00:00 UTC after $2 realized loss
+  session_loss_halt_usd: 10  # EXIT process after $10 cumulative realized loss since start
   poll_interval_ms: 750     # ↓ from 1500 (2× faster ticks; HTTP calls now batched/parallel so total latency fits)
   # === Reconcile cadence tightened 2026-05-28 ===
   # Overnight the /activity fill feed double-counted fills (unstable trade ids),
@@ -166,8 +183,17 @@ live:
   # corrected it. In that window the hedge/spend caps acted on garbage and
   # positions grew to 30-40 shares (8x the 5-share cap). 10s shrinks the drift
   # window 3x; the deriveTradeId fix removes the double-count at source.
-  reconcile_every_sec: 8   # on-chain position drift check cadence (0 disables)
+  reconcile_every_sec: 2   # ↓ from 4 (2026-05-30): fills arrive in <4s bursts that
+                           # the cap couldn't see between reconciles (a leg ran to 15
+                           # sh in one burst). 2s halves that blind window. lastOnchain
+                           # shares/cost feed the on-chain-aware inventory + hedge caps.
   reconcile_correct: true   # snap tracked shares to on-chain truth on drift (false = log-only)
+  # Debounce (2026-05-29): /activity fills lag the chain ~15-60s. Snapping on the
+  # FIRST detection, then applying the lagging fill on top, double-counts shares
+  # (NO leg reached 43.3 tracked vs 21.7 on-chain → inflated -$7.25 PnL + a false
+  # halt at -$2 real). Only correct a drift that has persisted continuously this
+  # long; shorter drift self-closes when the fill lands. Keep > worst-case lag.
+  reconcile_min_persist_ms: 60000
   # Cash-floor circuit breaker (2026-05-28). Winners auto-redeem at the account
   # level, so a falling balance is REAL losses, not locked capital. Overnight the
   # balance fell $25 — oversized directional positions (from the tracking bug
@@ -185,6 +211,6 @@ live:
   net_worth_halt_usd: 15
   # ── Session stop limits ────────────────────────────────────────────────────
   # All three pause until 00:00 UTC (same as daily_loss_halt). 0 = disabled.
-  session_max_windows: 0         # stop after N resolved windows (0 = no limit)
+  session_max_windows: 5        # stop after N resolved windows (0 = no limit)
   session_take_profit_usd: 0     # lock in gains when session profit >= this (0 = disabled)
   session_max_consec_losses: 3   # pause after 3 consecutive losing windows (0 = disabled)

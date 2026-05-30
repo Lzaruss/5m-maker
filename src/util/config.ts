@@ -152,6 +152,13 @@ export interface LiveConfig {
    *  (and adjusts cash at cost basis). When false, drift is only LOGGED — useful
    *  for observe-only validation before trusting the correction. */
   reconcileCorrect: boolean;
+  /** A detected drift is only CORRECTED after it has persisted continuously for
+   *  at least this long (ms). Shorter-lived drift is treated as a lagging
+   *  /activity fill that will self-close when it lands, NOT a genuinely missed
+   *  trade — this debounce prevents the snap-then-fill double-count that inflated
+   *  the 2026-05-29 NO leg to 2x its real size. Should exceed the worst-case fill
+   *  lag (~60 s). */
+  reconcileMinPersistMs: number;
   // ── Session stop limits ─────────────────────────────────────────────────
   /** Pause for the rest of the UTC day after this many resolved windows.
    *  "Trade the morning, then rest." 0 = disabled. */
@@ -253,6 +260,7 @@ export function parseBotYaml(raw: string): BotConfig {
     pollIntervalMs: lv.poll_interval_ms ?? 1500,
     reconcileEverySec: lv.reconcile_every_sec ?? 30,
     reconcileCorrect: lv.reconcile_correct ?? true,
+    reconcileMinPersistMs: lv.reconcile_min_persist_ms ?? 60000,
     cashFloorUsd: lv.cash_floor_usd ?? 0,
     netWorthHaltUsd: lv.net_worth_halt_usd ?? 0,
     sessionMaxWindows: lv.session_max_windows ?? 0,

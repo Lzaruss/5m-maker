@@ -46,10 +46,18 @@ import { ClobMarketFeed, type BookSnapshot } from './marketFeed/clobMarketFeed.j
 import { computeQuotes } from './engine/quoter.js';
 import { checkGates } from './live/riskGate.js';
 import { reconcile, type DesiredQuote, type LiveOrder } from './live/reconciler.js';
-import { emptyAccount, applyTrade, pnl, reconcileAccount, type Account } from './live/accounting.js';
+import {
+  emptyAccount,
+  applyTrade,
+  pnl,
+  reconcileAccount,
+  driftPersistedMs,
+  newDriftWatch,
+  type Account,
+  type DriftWatch,
+} from './live/accounting.js';
 import {
   buildDesired,
-  hedgeBlocksBuy as computeHedgeBlock,
   spendBlocksBuy as computeSpendBlock,
   legSettlePrice,
 } from './live/legPolicy.js';
@@ -127,6 +135,15 @@ interface TokenLeg {
   buyShares: number;
   sellShares: number;
   sellNotional: number;
+  /** Debounce state for reconcile corrections: how long the current drift has
+   *  persisted. Prevents snapping (and then double-counting) a drift that is just
+   *  a lagging /activity fill. See `driftPersistedMs`. */
+  driftWatch: DriftWatch;
+  /** Most recent ON-CHAIN share count from the reconcile poll (NaN until the
+   *  first poll). The hedge cap uses this instead of the /activity-tracked count
+   *  so fill lag (~20-60s) can't hide real inventory and let the leg over-buy —
+   *  the mechanism behind the 2026-05-29 21.7-share naked-NO position. */
+  lastOnchainShares: number;
 }
 
 /** Maximum flatten attempts per leg per window. See `flattenAttempts` above. */
@@ -276,6 +293,12 @@ async function main(): Promise<void> {
   let placeFailCount = 0;
   let hedgeBlockCount = 0;
   let spendBlockCount = 0;
+  // Fix-validation counters (2026-05-29): how often each new guard actually bit.
+  let driftDebouncedCount = 0; // reconcile corrections held back by the debounce
+  let driftAppliedCount = 0;   // reconcile corrections actually applied (genuine misses)
+  let avgZeroSnapCount = 0;    // missed-BUY drifts skipped because avgPrice was 0 (Fix 1)
+  let clipClampedCount = 0;    // BUY clips shrunk by the unmatched-room clamp
+  let unhedgeableBlockCount = 0; // opening BUYs suppressed because the pair can't be completed
   let windowsCount = 0;
   let winningWindows = 0;
   let losingWindows = 0;
@@ -288,6 +311,25 @@ async function main(): Promise<void> {
   let lastNetWorthMs = 0;
   let lastNetWorthPushMs = 0;
   let netWorthHaltTriggered = false;
+
+  // Unified session-stop event. Every halt path also writes one of these with a
+  // consistent {reason, pnl, context} shape so post-hoc analysis (and a restart)
+  // has a single greppable record of WHY the bot stopped — the per-kind events
+  // (take_profit_halt, halt, session_halt, …) stay for backward compatibility.
+  const logSessionStop = (
+    reason: 'take_profit' | 'max_windows' | 'max_consec_losses' | 'daily_loss' | 'session_loss',
+    extra: Record<string, unknown> = {},
+  ): void =>
+    logEvent({
+      kind: 'session_stop',
+      reason,
+      realizedSessionUsd,
+      realizedTodayUsd,
+      unresolvedDeferredUsd,
+      windowsCount,
+      consecLosses,
+      ...extra,
+    });
 
   // Per-asset market loop. Each configured asset runs its own instance
   // concurrently; they share PnL counters, halt state, and the deployed-capital
@@ -361,8 +403,8 @@ async function main(): Promise<void> {
     // poll) is still captured. fetchOurTrades adds its own slack on top.
     const windowSinceMs = Date.now() - 60_000;
     const legs: TokenLeg[] = [
-      { tokenId: market.yesTokenId, label: 'YES', account: emptyAccount(), sinceMs: windowSinceMs, flattened: false, sharesAtFlatten: 0, flattenAttempts: 0, buyNotionalFilled: 0, buyShares: 0, sellShares: 0, sellNotional: 0 },
-      { tokenId: market.noTokenId, label: 'NO', account: emptyAccount(), sinceMs: windowSinceMs, flattened: false, sharesAtFlatten: 0, flattenAttempts: 0, buyNotionalFilled: 0, buyShares: 0, sellShares: 0, sellNotional: 0 },
+      { tokenId: market.yesTokenId, label: 'YES', account: emptyAccount(), sinceMs: windowSinceMs, flattened: false, sharesAtFlatten: 0, flattenAttempts: 0, buyNotionalFilled: 0, buyShares: 0, sellShares: 0, sellNotional: 0, driftWatch: newDriftWatch(), lastOnchainShares: NaN },
+      { tokenId: market.noTokenId, label: 'NO', account: emptyAccount(), sinceMs: windowSinceMs, flattened: false, sharesAtFlatten: 0, flattenAttempts: 0, buyNotionalFilled: 0, buyShares: 0, sellShares: 0, sellNotional: 0, driftWatch: newDriftWatch(), lastOnchainShares: NaN },
     ];
     // Clear any SELL suppression from the previous window so both legs start clean.
     for (const leg of legs) clearSellBalanceRejected(leg.tokenId);
@@ -391,6 +433,21 @@ async function main(): Promise<void> {
     try {
       const snap = await getAccountValue();
       windowOpenNetWorthUsd = snap.netWorthUsd;
+      // Exact wallet snapshot AT window open (the periodic reality_check runs on
+      // its own ~90s cadence and won't line up with the boundary). Paired with the
+      // window_close snap it gives an exact per-window walletDelta post-hoc.
+      logEvent({
+        kind: 'wallet_snap',
+        phase: 'window_open',
+        yesToken: market.yesTokenId,
+        noToken: market.noTokenId,
+        cashUsd: snap.cashUsd,
+        positionValueUsd: snap.positionValueUsd,
+        redeemableUsd: snap.redeemableUsd,
+        netWorthUsd: snap.netWorthUsd,
+        openCount: snap.openCount,
+        redeemableCount: snap.redeemableCount,
+      });
     } catch {
       // non-fatal — wallet cross-check will be skipped for this window
     }
@@ -439,6 +496,11 @@ async function main(): Promise<void> {
           placeFailRatePct: Math.round(failRate * 100),
           hedgeBlockCount,
           spendBlockCount,
+          driftDebouncedCount,
+          driftAppliedCount,
+          avgZeroSnapCount,
+          clipClampedCount,
+          unhedgeableBlockCount,
           throttled: isThrottled(),
         });
         logger.info(
@@ -552,6 +614,11 @@ async function main(): Promise<void> {
               side: t.side,
               price: t.price,
               shares: t.shares,
+              // Real fill time (from the trade), vs the event `ts` which is the
+              // poll time. latencyMs = how late /activity surfaced this fill —
+              // the input to tuning reconcile_min_persist_ms.
+              fillTs: t.tsMs,
+              latencyMs: Date.now() - t.tsMs,
             });
           }
         }
@@ -574,8 +641,35 @@ async function main(): Promise<void> {
           for (const leg of legs) {
             const oc = onchain.get(leg.tokenId);
             if (oc) {
+              // Record the on-chain truth for the hedge cap regardless of whether
+              // we snap the account — the cap must see real inventory even while
+              // a correction is debounced.
+              leg.lastOnchainShares = oc.shares;
               const before = leg.account.shares;
               const r = reconcileAccount(leg.account, oc.shares, oc.avgPrice);
+              // DEBOUNCE: only act on a drift that has persisted longer than the
+              // worst-case /activity fill lag. A freshly-appeared drift is almost
+              // always a lagging fill; snapping now AND applying that fill when it
+              // lands double-counts the shares (2026-05-29 NO leg: 43.3 tracked vs
+              // 21.7 on-chain → inflated -$7.25 PnL + false halt).
+              const persistedMs = driftPersistedMs(leg.driftWatch, r.drift, Date.now());
+              const debounced = persistedMs < cfg.live.reconcileMinPersistMs;
+              const willCorrect = r.corrected && !debounced && cfg.live.reconcileCorrect;
+              // Diagnostic reason: collapse the reconcileAccount outcome and the
+              // orchestrator gates (debounce, log-only mode) into one field so the
+              // two "corrected:false" cases (tolerance vs. suppression) are
+              // distinguishable without re-deriving them from the raw numbers.
+              const reconcileReason =
+                r.reason !== 'snap'
+                  ? r.reason
+                  : debounced
+                    ? 'debounced'
+                    : !cfg.live.reconcileCorrect
+                      ? 'logged_only'
+                      : 'applied';
+              if (r.reason === 'snap' && debounced) driftDebouncedCount++;
+              if (r.reason === 'avgprice_zero') avgZeroSnapCount++;
+              if (willCorrect) driftAppliedCount++;
               logEvent({
                 kind: 'reconcile_check',
                 token: leg.tokenId,
@@ -584,12 +678,15 @@ async function main(): Promise<void> {
                 onchain: oc.shares,
                 avgPrice: oc.avgPrice,
                 drift: r.drift,
-                corrected: r.corrected && cfg.live.reconcileCorrect,
+                persistedMs,
+                reason: reconcileReason,
+                debounced: r.reason === 'snap' && debounced,
+                corrected: willCorrect,
               });
-              if (r.corrected && cfg.live.reconcileCorrect) {
+              if (willCorrect) {
                 leg.account = r.account;
                 logger.warn(
-                  { leg: leg.label, before, onchain: oc.shares, avgPrice: oc.avgPrice, drift: r.drift },
+                  { leg: leg.label, before, onchain: oc.shares, avgPrice: oc.avgPrice, drift: r.drift, persistedMs },
                   'inventory drift CORRECTED to on-chain truth',
                 );
               }
@@ -655,6 +752,7 @@ async function main(): Promise<void> {
       }
       if (realizedTodayUsd <= -cfg.live.dailyLossHaltUsd) {
         logEvent({ kind: 'halt', realizedTodayUsd, dailyLossHaltUsd: cfg.live.dailyLossHaltUsd, dayPnl });
+        logSessionStop('daily_loss', { dailyLossHaltUsd: cfg.live.dailyLossHaltUsd, dayPnl });
         logger.error({ realizedTodayUsd, dayPnl }, 'DAILY LOSS HALT (realized) — cancelling, flattening, and pausing until UTC midnight');
         void notifier.dailyHalt(realizedTodayUsd, cfg.live.dailyLossHaltUsd);
         if (enabled) await cancelAll();
@@ -800,17 +898,33 @@ async function main(): Promise<void> {
         const bestAsk = book.asks[0].price;
         if (!(bestBid > 0) || !(bestAsk > 0)) continue;
         const mid = legMids[leg.tokenId];
-        const inventoryUsd = leg.account.shares * mid;
+        // ON-CHAIN-AWARE inventory (2026-05-30): /activity fills lag the chain by
+        // 4-30s (measured), so leg.account.shares understates real holdings during
+        // a fill burst — and the inventory cap, computed from it, fails to bite.
+        // That let a leg run to 20 shares vs the ~$cap. Use the most recent on-chain
+        // count when it is higher; the cap then bounds REAL per-leg dollar exposure.
+        const legSharesEff = Number.isFinite(leg.lastOnchainShares)
+          ? Math.max(leg.account.shares, leg.lastOnchainShares)
+          : leg.account.shares;
+        const inventoryUsd = legSharesEff * mid; // notional, for the quoter's skew
 
-        // Effective inventory the BUY gate sees = realized inventory + any
-        // resting BUY notional on THIS leg. Without this, the gate only sees
-        // realized fills (lagged by ~15s via /activity polling) while the
-        // venue may already have additional BUYs that could fill imminently.
-        // Including pending BUYs prevents stacking another order on top of
-        // one that hasn't filled yet — the 2026-05-26 19:49 UTC over-fill
-        // scenario (31 NO shares vs $3 cap).
+        // COST-BASED cap (2026-05-30): the cap must bound the MAX LOSS, which is the
+        // cost paid for the held shares, NOT their current value. A falling underdog
+        // bought at 0.30 and now at 0.22 has notional 0.22×N but cost 0.30×N and
+        // loses the full cost if it settles to 0. Capping on notional let a leg run
+        // to 15 sh / $5.5 cost while notional read < $3 (the falling-knife hole).
+        // avgBuyPrice is the leg's entry cost (a stable ratio even while absolute
+        // fill counts lag); × on-chain-aware shares = real cost at risk.
+        const avgBuyPrice = leg.buyShares > 0 ? leg.buyNotionalFilled / leg.buyShares : mid;
+        const heldCostUsd = legSharesEff * avgBuyPrice;
+
+        // Effective exposure the BUY gate sees = held cost + resting BUY cost. The
+        // resting notional is the cost those orders add if they fill, so the sum is
+        // the worst-case loss if everything fills and settles to 0 — exactly what
+        // maxInventoryUsd should bound. Including resting prevents stacking a new
+        // order on top of one that hasn't filled (the 2026-05-26 over-fill).
         const pendingBuyUsd = openBuyNotional(openByToken[leg.tokenId]);
-        const effectiveLongUsd = inventoryUsd + pendingBuyUsd;
+        const effectiveLongUsd = heldCostUsd + pendingBuyUsd;
 
         const gates = checkGates({
           realizedPnlTodayUsd: dayPnl,
@@ -880,11 +994,33 @@ async function main(): Promise<void> {
         // otherLegShares >= maxUnmatchedShares`, BUY is suppressed on this leg
         // until the other catches up — forces matched-pair accumulation, bounds
         // worst-case single-window directional exposure to ~maxUnmatchedShares × $1.
-        const hedgeBlock = computeHedgeBlock(
-          leg.account.shares,
-          otherLegShares,
-          cfg.maker.maxUnmatchedShares,
-        );
+        //
+        // ON-CHAIN-AWARE (2026-05-29): /activity fills lag ~20-60s, so the tracked
+        // count understates real inventory exactly when the cap most needs to bind
+        // (that run placed large NO clips while tracked NO still read ~0, ending
+        // with 21.7 naked NO). `legSharesEff` (computed above) is the max of tracked
+        // and the latest on-chain count for THIS leg; use the LOWER count for the
+        // OTHER leg so the hedge room is the conservative (smallest) estimate.
+        const otherSharesEff =
+          otherLeg && Number.isFinite(otherLeg.lastOnchainShares)
+            ? Math.min(otherLegShares, otherLeg.lastOnchainShares)
+            : otherLegShares;
+        const buyUnmatchedRoomShares = cfg.maker.maxUnmatchedShares - (legSharesEff - otherSharesEff);
+        const hedgeBlock = buyUnmatchedRoomShares <= 0;
+
+        // UN-HEDGEABLE OPENING GUARD (2026-05-30). The bot only buys the cheap side
+        // (<= max_buy_price). In a directional move one leg is the cheap UNDERDOG and
+        // the other the expensive FAVORITE; we can't buy the favorite to complete the
+        // pair, so any add to the underdog is NAKED directional risk that historically
+        // lost (3 straight negative sessions). Suppress a BUY that ADDS to the heavy/
+        // equal side when the OTHER leg's touch is above max_buy_price (it's the
+        // favorite → pair not completable). Hedge-completion buys (this leg BEHIND the
+        // other) are exempt — they reduce existing risk. Result: the bot only OPENS
+        // when both legs are buyable (near 50/50, where pairs actually complete).
+        const otherLegBook = otherLeg ? books.get(otherLeg.tokenId) : undefined;
+        const otherLegBestBid = otherLegBook?.bids[0]?.price ?? 0;
+        const thisLegHeavyOrEqual = legSharesEff >= otherSharesEff - 0.5;
+        const openingUnhedgeable = thisLegHeavyOrEqual && otherLegBestBid > cfg.maker.maxBuyPrice;
         // Spend cap is based on EFFECTIVE EXPOSURE: filled BUYs (from /activity
         // polls) + resting BUY notional (queried this tick). Cancel+replace
         // cycles no longer count against the cap because cancelled orders are
@@ -908,10 +1044,20 @@ async function main(): Promise<void> {
           hedgeBlocksBuy: hedgeBlock,
           spendBlocksBuy: spendBlock,
           disableSell: cfg.maker.disableSell || isSellBalanceRejected(leg.tokenId),
+          buyUnmatchedRoomShares,
+          minClipShares: cfg.maker.minQuoteShares,
+          openingUnhedgeable,
         });
 
         if (hedgeBlock) hedgeBlockCount++;
         if (spendBlock) spendBlockCount++;
+        if (openingUnhedgeable && decision.action === 'quote' && decision.bid) unhedgeableBlockCount++;
+        // Count when the unmatched-room clamp actually shrunk a BUY clip (Fix B
+        // biting) — the quoter wanted a bigger size than the hedge room allowed.
+        const buyDesired = desired.find((d) => d.side === 'BUY');
+        if (decision.action === 'quote' && decision.bid && buyDesired && buyDesired.size < decision.bid.sizeShares - 1e-9) {
+          clipClampedCount++;
+        }
         const { toCancel, toPlace } = reconcile(
           openByToken[leg.tokenId],
           desired,
@@ -1021,6 +1167,8 @@ async function main(): Promise<void> {
           side: t.side,
           price: t.price,
           shares: t.shares,
+          fillTs: t.tsMs,
+          latencyMs: Date.now() - t.tsMs,
           late: true,
         });
       }
@@ -1144,18 +1292,50 @@ async function main(): Promise<void> {
       });
     }
 
+    // Wallet cross-check AT window close (best-effort), captured BEFORE the
+    // window_result event so the exact mark/wallet gap lands in the JSONL without
+    // depending on Telegram. A wrong resolution (Gamma showing the wrong winner
+    // transiently) or an accounting double-count shows up here as a gap between
+    // the mark-based windowPnl and the real walletWindowDelta.
+    let walletWindowDelta: number | null = null;
+    try {
+      const snapClose = await getAccountValue();
+      logEvent({
+        kind: 'wallet_snap',
+        phase: 'window_close',
+        yesToken: market.yesTokenId,
+        noToken: market.noTokenId,
+        cashUsd: snapClose.cashUsd,
+        positionValueUsd: snapClose.positionValueUsd,
+        redeemableUsd: snapClose.redeemableUsd,
+        netWorthUsd: snapClose.netWorthUsd,
+        openCount: snapClose.openCount,
+        redeemableCount: snapClose.redeemableCount,
+      });
+      if (windowOpenNetWorthUsd !== null) {
+        walletWindowDelta = snapClose.netWorthUsd - windowOpenNetWorthUsd;
+      }
+    } catch {
+      // non-fatal — window_result just omits the wallet delta
+    }
+
     logEvent({
       kind: 'window_result',
       yesToken: market.yesTokenId,
       noToken: market.noTokenId,
+      question: market.question,
       windowPnl,
       realizedTodayUsd,
       realizedSessionUsd,
       unresolvedDeferredUsd,
       resolved: !!res,
       yesWon: res ? res.yesWon : null,
+      // Real wallet move over the window and its gap vs the mark-based windowPnl —
+      // the per-window mark/wallet discrepancy, analyzable without Telegram.
+      walletWindowDelta,
+      markVsWalletGapUsd: walletWindowDelta != null ? windowPnl - walletWindowDelta : null,
     });
-    logger.info({ windowPnl, realizedTodayUsd, realizedSessionUsd, unresolvedDeferredUsd, resolved: !!res }, 'window result');
+    logger.info({ windowPnl, realizedTodayUsd, realizedSessionUsd, unresolvedDeferredUsd, walletWindowDelta, resolved: !!res }, 'window result');
     state.lastWindow = {
       ts: Date.now(),
       asset: ASSET,
@@ -1166,18 +1346,6 @@ async function main(): Promise<void> {
     };
     // Push notable windows to Telegram (skip the noise of zero-PnL windows).
     if (Math.abs(windowPnl) >= 0.01) {
-      // Best-effort: fetch the current wallet to cross-check the mark-based
-      // windowPnl against on-chain reality. A wrong resolution (Gamma showing
-      // the wrong winner transiently) shows up immediately as a mark/wallet gap.
-      let walletWindowDelta: number | null = null;
-      if (windowOpenNetWorthUsd !== null) {
-        try {
-          const snapClose = await getAccountValue();
-          walletWindowDelta = snapClose.netWorthUsd - windowOpenNetWorthUsd;
-        } catch {
-          // non-fatal — notification still works without the wallet cross-check
-        }
-      }
       void notifier.windowResult(windowPnl, realizedTodayUsd, res ? res.yesWon : null, walletWindowDelta);
     }
 
@@ -1189,18 +1357,21 @@ async function main(): Promise<void> {
     if (res) {
       if (cfg.live.sessionTakeProfitUsd > 0 && realizedSessionUsd >= cfg.live.sessionTakeProfitUsd) {
         logEvent({ kind: 'take_profit_halt', realizedSessionUsd, threshold: cfg.live.sessionTakeProfitUsd });
+        logSessionStop('take_profit', { threshold: cfg.live.sessionTakeProfitUsd });
         logger.info({ realizedSessionUsd, threshold: cfg.live.sessionTakeProfitUsd }, 'TAKE-PROFIT STOP — pausing until UTC midnight');
         void notifier.takeProfitHalt(realizedSessionUsd, cfg.live.sessionTakeProfitUsd);
         halted = true;
         haltUntilMs = nextUtcMidnightMs();
       } else if (cfg.live.sessionMaxWindows > 0 && windowsCount >= cfg.live.sessionMaxWindows) {
         logEvent({ kind: 'max_windows_halt', windowsCount, limit: cfg.live.sessionMaxWindows, realizedSessionUsd });
+        logSessionStop('max_windows', { limit: cfg.live.sessionMaxWindows });
         logger.info({ windowsCount, limit: cfg.live.sessionMaxWindows }, 'MAX-WINDOWS STOP — pausing until UTC midnight');
         void notifier.maxWindowsHalt(windowsCount, realizedSessionUsd);
         halted = true;
         haltUntilMs = nextUtcMidnightMs();
       } else if (cfg.live.sessionMaxConsecLosses > 0 && consecLosses >= cfg.live.sessionMaxConsecLosses) {
         logEvent({ kind: 'consec_losses_halt', consecLosses, limit: cfg.live.sessionMaxConsecLosses, realizedSessionUsd });
+        logSessionStop('max_consec_losses', { limit: cfg.live.sessionMaxConsecLosses });
         logger.warn({ consecLosses, limit: cfg.live.sessionMaxConsecLosses }, 'CONSECUTIVE-LOSSES STOP — pausing until UTC midnight');
         void notifier.maxConsecLossesHalt(consecLosses, realizedSessionUsd);
         halted = true;
@@ -1218,6 +1389,7 @@ async function main(): Promise<void> {
         realizedTodayUsd,
         sessionLossHaltUsd: cfg.live.sessionLossHaltUsd,
       });
+      logSessionStop('session_loss', { sessionLossHaltUsd: cfg.live.sessionLossHaltUsd });
       logger.error(
         { realizedSessionUsd, sessionLossHaltUsd: cfg.live.sessionLossHaltUsd },
         'SESSION LOSS HALT — exiting process; restart manually after reviewing balance',

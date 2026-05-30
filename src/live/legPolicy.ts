@@ -59,6 +59,24 @@ export interface BuildDesiredParams {
   spendBlocksBuy: boolean;
   /** BUY-only / hold-to-resolution mode. */
   disableSell: boolean;
+  /** Shares of headroom left under the hedge cap for a BUY on THIS leg:
+   *  `maxUnmatchedShares - (thisLegShares - otherLegShares)`, computed by the
+   *  caller from ON-CHAIN-aware counts (so fill lag can't hide real inventory).
+   *  The BUY clip is shrunk to this so a single fill cannot push net unmatched
+   *  inventory past the cap. Large when this leg is BEHIND (hedge completion,
+   *  risk-reducing → not throttled); <= 0 means at/over the cap. */
+  buyUnmatchedRoomShares: number;
+  /** Venue minimum order size (shares). A BUY clip shrunk below this by the
+   *  room clamp is dropped rather than placed (the venue would reject it). */
+  minClipShares: number;
+  /** True when this BUY would ADD naked directional exposure that cannot be
+   *  hedged: this leg is already the heavy (or equal) side AND the other leg is
+   *  the expensive favorite we can't buy to complete the pair. Suppresses the
+   *  BUY. Hedge-completion buys (this leg BEHIND the other) are never flagged —
+   *  they reduce existing risk. This is the 2026-05-30 fix for the core leak:
+   *  in a directional move the bot could only buy the falling underdog and never
+   *  the rising favorite, so it accumulated naked losers. */
+  openingUnhedgeable: boolean;
 }
 
 /**
@@ -89,8 +107,21 @@ export function buildDesired(p: BuildDesiredParams): DesiredQuote[] {
 
   const { bid, ask } = p.decision;
 
-  if (bid && p.allowBuy && !p.hedgeBlocksBuy && !p.spendBlocksBuy && bid.price < p.bestAsk) {
-    desired.push({ side: 'BUY', price: bid.price, size: bid.sizeShares });
+  if (bid && p.allowBuy && !p.hedgeBlocksBuy && !p.spendBlocksBuy && !p.openingUnhedgeable && bid.price < p.bestAsk) {
+    // SIZE CLAMP (2026-05-29): the hedge cap is a quote-time boolean, so a single
+    // large clip — e.g. 16.7 sh at $0.06 — fills and overshoots maxUnmatchedShares
+    // 3x in one go (the run that left 21.7 naked NO and lost ~$3). Shrink the clip
+    // to the remaining unmatched room so an oversized clip can't blow past the cap.
+    //
+    // FLOOR (2026-05-30): never shrink BELOW the venue minimum clip. When the cap
+    // is smaller than one clip (maxUnmatchedShares < minClipShares) the room can
+    // never fit a full clip, so a strict clamp would drop EVERY opening BUY and the
+    // bot could never trade (the "3 windows, 0 orders" bug). Whether to open at all
+    // is the caller's hedgeBlocksBuy gate (room <= 0 → blocked); once we are under
+    // the cap we place at least one minimum clip, accepting a bounded overshoot of
+    // at most one clip beyond the cap.
+    const clip = Math.min(bid.sizeShares, Math.max(p.buyUnmatchedRoomShares, p.minClipShares));
+    desired.push({ side: 'BUY', price: bid.price, size: clip });
   }
 
   // Only the naked excess over the matched pair is eligible to sell. Requiring

@@ -192,6 +192,32 @@ describe('computeQuotes', () => {
     expect(d.reason).toBe('buy_above_max_price');
   });
 
+  it('tightens the hedge ceiling to the even-money price when otherLegAvgCost is known', () => {
+    // Other leg cost 0.30 → ceiling = 1 - 0.30 - 0.02 = 0.68. A hedge BUY at 0.67
+    // is allowed; the same setup at a higher mid would be capped to 0.68.
+    const d = computeQuotes(
+      { ...base, bestBid: 0.69, bestAsk: 0.71, otherLegShares: 8, otherLegAvgCost: 0.30 },
+      cfg,
+    );
+    if (d.action !== 'quote') throw new Error('expected quote');
+    expect(d.bid).not.toBeNull();
+    expect(d.bid!.price).toBeLessThanOrEqual(0.68);
+  });
+
+  it('does NOT relax above maxBuyPrice when otherLegAvgCost is corrupt (~0 free shares)', () => {
+    // Reconcile snapped on-chain shares with avgPrice=0 → other leg has shares but
+    // cashUsd=0 → otherLegAvgCost = 0. This must NOT collapse the ceiling to 0.85;
+    // it falls back to the conservative cfg.maxBuyPrice (0.50), so a BUY at 0.67
+    // is rejected exactly like the non-hedge underdog filter. (2026-05-29 bug.)
+    const d = computeQuotes(
+      { ...base, bestBid: 0.69, bestAsk: 0.71, otherLegShares: 8, otherLegAvgCost: 0 },
+      cfg,
+    );
+    if (d.action !== 'quote') throw new Error('expected quote');
+    expect(d.bid).toBeNull();
+    expect(d.reason).toBe('buy_above_max_price');
+  });
+
   // ── Tier-2 entry/regime gates ───────────────────────────────────────────
   describe('Tier-2 gates', () => {
     it('vol_regime_halt: pauses BOTH sides on an extreme move', () => {
