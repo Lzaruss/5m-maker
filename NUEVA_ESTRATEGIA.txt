@@ -1,0 +1,7 @@
+Para el bot sniper: La idea: Hoy el bot espera (como maker) a que le llenen el segundo lado, y nunca pasa. En vez de eso: cuando se llena un lado, miramos el ask del otro lado. Si comprándolo AHORA (cruzando el spread, pagando taker) el par todavía cuesta ≤ 0.98, lo compramos y cerramos el par con beneficio garantizado. Si no sale a cuenta, no lo hacemos.
+
+Qué cambiaría: Código nuevo — tras un fill, una rutina que evalúa el ask del otro leg y dispara una orden taker si el par bloquea profit.
+
+A favor: Nunca te quedas desnudo cuando hay oportunidad de cerrar con ganancia. Captura "dislocaciones" (momentos en que el mercado está temporalmente ineficiente, Up+Down < 1).
+En contra: En libros eficientes (Up+Down ≈ 1.00 casi siempre), rara vez saldrá a cuenta → disparará poco. No es un generador de volumen, es un "cazador de dislocaciones". El resto del tiempo el bot sigue idle.
+Cuándo elegirla: Si quieres garantía de "cero pérdidas direccionales" y te vale capturar solo las oportunidades limpias, aunque sean pocas.

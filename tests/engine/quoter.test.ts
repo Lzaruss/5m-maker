@@ -23,6 +23,13 @@ const cfg: MakerConfig = {
   fillParticipation: 1.0,
   takerFeeRate: 0.07,
   minPairProfitPerShare: 0.02,
+  takerComplete: false,
+  favoriteHarvester: false,
+  harvestEnterSec: 90,
+  harvestExitSec: 30,
+  harvestMinMid: 0.6,
+  harvestMaxAsk: 0.9,
+  harvestClipShares: 5,
   // Tier-2 gates DISABLED in the base fixture so the original tests are
   // unaffected; each gate test below enables exactly what it exercises.
   noTradeBand50: 0,

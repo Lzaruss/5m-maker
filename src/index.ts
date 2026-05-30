@@ -44,6 +44,7 @@ import { fetchMarkets, fetchResolution, gammaBackoffMs, type ShortMarket } from 
 import { PriceFeed } from './signals/priceFeed.js';
 import { ClobMarketFeed, type BookSnapshot } from './marketFeed/clobMarketFeed.js';
 import { computeQuotes } from './engine/quoter.js';
+import { decideHarvest } from './engine/harvester.js';
 import { checkGates } from './live/riskGate.js';
 import { reconcile, type DesiredQuote, type LiveOrder } from './live/reconciler.js';
 import {
@@ -144,10 +145,19 @@ interface TokenLeg {
    *  so fill lag (~20-60s) can't hide real inventory and let the leg over-buy —
    *  the mechanism behind the 2026-05-29 21.7-share naked-NO position. */
   lastOnchainShares: number;
+  /** Epoch ms of the last opportunistic taker pair-completion on THIS leg. A
+   *  short cooldown stops a second completion firing before the just-bought
+   *  shares surface (via the 2s reconcile) and close the unmatched excess. */
+  lastPairCompleteMs: number;
 }
 
 /** Maximum flatten attempts per leg per window. See `flattenAttempts` above. */
 const MAX_FLATTEN_ATTEMPTS = 2;
+
+/** Cooldown after a taker pair-completion so the just-bought shares can surface
+ *  via the 2s reconcile before we evaluate completing again (avoids double-buys
+ *  while the fill is in flight). */
+const PAIR_COMPLETE_COOLDOWN_MS = 6000;
 
 // --------------------------------------------------------------------------
 // Shutdown — runs exactly once.
@@ -299,6 +309,13 @@ async function main(): Promise<void> {
   let avgZeroSnapCount = 0;    // missed-BUY drifts skipped because avgPrice was 0 (Fix 1)
   let clipClampedCount = 0;    // BUY clips shrunk by the unmatched-room clamp
   let unhedgeableBlockCount = 0; // opening BUYs suppressed because the pair can't be completed
+  let pairCompleteCount = 0;   // opportunistic taker pair-completions that locked profit
+  // Favorite Harvester shadow P&L: the hypothetical settle-based result of every
+  // harvest entry, net of the taker fee. In DRY-RUN (no real fills) this is the
+  // only meaningful P&L track; in live it cross-checks the real realized number.
+  let harvestShadowUsd = 0;
+  let harvestEntries = 0;
+  let harvestWins = 0;
   let windowsCount = 0;
   let winningWindows = 0;
   let losingWindows = 0;
@@ -328,6 +345,9 @@ async function main(): Promise<void> {
       unresolvedDeferredUsd,
       windowsCount,
       consecLosses,
+      harvestShadowUsd,
+      harvestEntries,
+      harvestWins,
       ...extra,
     });
 
@@ -403,11 +423,19 @@ async function main(): Promise<void> {
     // poll) is still captured. fetchOurTrades adds its own slack on top.
     const windowSinceMs = Date.now() - 60_000;
     const legs: TokenLeg[] = [
-      { tokenId: market.yesTokenId, label: 'YES', account: emptyAccount(), sinceMs: windowSinceMs, flattened: false, sharesAtFlatten: 0, flattenAttempts: 0, buyNotionalFilled: 0, buyShares: 0, sellShares: 0, sellNotional: 0, driftWatch: newDriftWatch(), lastOnchainShares: NaN },
-      { tokenId: market.noTokenId, label: 'NO', account: emptyAccount(), sinceMs: windowSinceMs, flattened: false, sharesAtFlatten: 0, flattenAttempts: 0, buyNotionalFilled: 0, buyShares: 0, sellShares: 0, sellNotional: 0, driftWatch: newDriftWatch(), lastOnchainShares: NaN },
+      { tokenId: market.yesTokenId, label: 'YES', account: emptyAccount(), sinceMs: windowSinceMs, flattened: false, sharesAtFlatten: 0, flattenAttempts: 0, buyNotionalFilled: 0, buyShares: 0, sellShares: 0, sellNotional: 0, driftWatch: newDriftWatch(), lastOnchainShares: NaN, lastPairCompleteMs: 0 },
+      { tokenId: market.noTokenId, label: 'NO', account: emptyAccount(), sinceMs: windowSinceMs, flattened: false, sharesAtFlatten: 0, flattenAttempts: 0, buyNotionalFilled: 0, buyShares: 0, sellShares: 0, sellNotional: 0, driftWatch: newDriftWatch(), lastOnchainShares: NaN, lastPairCompleteMs: 0 },
     ];
     // Clear any SELL suppression from the previous window so both legs start clean.
     for (const leg of legs) clearSellBalanceRejected(leg.tokenId);
+
+    // Favorite Harvester per-window state: at most ONE taker entry per window,
+    // then hold to resolution. `harvestIntent` records what we bought so the
+    // window-close can compute the settle-based (shadow) P&L.
+    let harvested = false;
+    let harvestIntent:
+      | { tokenId: string; leg: 'YES' | 'NO'; ask: number; shares: number; mid: number; ttrSec: number; ts: number }
+      | null = null;
 
     logEvent({
       kind: 'window_open',
@@ -501,6 +529,10 @@ async function main(): Promise<void> {
           avgZeroSnapCount,
           clipClampedCount,
           unhedgeableBlockCount,
+          pairCompleteCount,
+          harvestShadowUsd,
+          harvestEntries,
+          harvestWins,
           throttled: isThrottled(),
         });
         logger.info(
@@ -771,6 +803,66 @@ async function main(): Promise<void> {
         break;
       }
 
+      // 3b. FAVORITE HARVESTER (2026-05-30 strategy redesign). When enabled this
+      //     REPLACES the matched-pair maker entirely: late in the window, cross
+      //     the spread to BUY the book's favorite (one clip) and HOLD to
+      //     resolution — never quote both sides, never sell. The earlier phases
+      //     (fills, reconcile, marks, daily-loss halt) still ran above; we skip
+      //     the maker flatten + quote phases below.
+      if (cfg.maker.favoriteHarvester) {
+        if (!harvested && !halted && !isThrottled() && !state.paused) {
+          const decision = decideHarvest({
+            ttrSec: timeToResolveSec,
+            enterSec: cfg.maker.harvestEnterSec,
+            exitSec: cfg.maker.harvestExitSec,
+            minMid: cfg.maker.harvestMinMid,
+            maxAsk: cfg.maker.harvestMaxAsk,
+            clipShares: cfg.maker.harvestClipShares,
+            minClipShares: cfg.maker.minQuoteShares,
+            legs: legs.map((l) => {
+              const b = books.get(l.tokenId);
+              return {
+                label: l.label,
+                bestBid: b?.bids[0]?.price ?? null,
+                bestAsk: b?.asks[0]?.price ?? null,
+                askSize: b?.asks[0]?.size ?? null,
+              };
+            }),
+          });
+          if (decision.action === 'enter' && decision.leg && decision.ask != null && decision.shares != null) {
+            const favLeg = legs.find((l) => l.label === decision.leg)!;
+            harvested = true;
+            harvestIntent = {
+              tokenId: favLeg.tokenId,
+              leg: decision.leg,
+              ask: decision.ask,
+              shares: decision.shares,
+              mid: decision.mid ?? 0,
+              ttrSec: timeToResolveSec,
+              ts: Date.now(),
+            };
+            logEvent({
+              kind: 'harvest_entry',
+              token: favLeg.tokenId,
+              leg: decision.leg,
+              ask: decision.ask,
+              shares: decision.shares,
+              mid: decision.mid,
+              ttrSec: Math.round(timeToResolveSec),
+              dryRun: !enabled,
+            });
+            logger.info(
+              { leg: decision.leg, ask: decision.ask, shares: decision.shares, mid: decision.mid, ttr: Math.round(timeToResolveSec) },
+              'FAVORITE HARVEST — taker buy (hold to resolution)',
+            );
+            // TAKER buy crossing to the ask. In dry-run (enabled=false) we log the
+            // intent only; the window-close shadow P&L still scores it.
+            if (enabled) await marketFlatten(favLeg.tokenId, 'BUY', decision.shares, decision.ask);
+          }
+        }
+        continue; // harvester holds to resolution — skip the maker flatten + quote phases
+      }
+
       // 4. FLATTEN PHASE — applies to BOTH legs. We always cancel resting
       //    orders at the boundary (otherwise we'd get lifted on the converging
       //    touch). Whether to ALSO market-flatten residual inventory depends
@@ -1007,6 +1099,52 @@ async function main(): Promise<void> {
             : otherLegShares;
         const buyUnmatchedRoomShares = cfg.maker.maxUnmatchedShares - (legSharesEff - otherSharesEff);
         const hedgeBlock = buyUnmatchedRoomShares <= 0;
+
+        // ── OPPORTUNISTIC TAKER PAIR-COMPLETION (Option 2, 2026-05-30) ───────────
+        // When the OTHER leg holds an unmatched excess and THIS leg's ASK is cheap
+        // enough that buying it (taker) still locks >= min_pair_profit AFTER taker
+        // fees, cross the spread to complete the pair. That excess + these shares
+        // become a matched pair redeeming to $1 → guaranteed locked profit. It is
+        // the only reliable way to complete a pair when passive fills are one-sided
+        // (the adverse-selection leak). Fires only when profitable, so it is a pure
+        // upside floor — most ticks it does nothing. Uses conservative eff counts
+        // (min for the other leg, max for this) so it never over-buys.
+        if (
+          cfg.maker.takerComplete &&
+          !gates.halted &&
+          otherLeg &&
+          otherLegAvgCost != null &&
+          lastCashUsd > cfg.live.cashFloorUsd &&
+          Date.now() - leg.lastPairCompleteMs > PAIR_COMPLETE_COOLDOWN_MS
+        ) {
+          const excessOnOther = otherSharesEff - legSharesEff; // unmatched shares the other leg holds
+          const askSize = book.asks[0]?.size ?? 0;
+          const feePerShare = cfg.maker.takerFeeRate * bestAsk * (1 - bestAsk);
+          const lockedProfit = 1 - otherLegAvgCost - bestAsk - feePerShare;
+          const completeShares = Math.min(excessOnOther, askSize);
+          if (
+            excessOnOther >= cfg.maker.minQuoteShares &&
+            completeShares >= cfg.maker.minQuoteShares &&
+            lockedProfit >= (cfg.maker.minPairProfitPerShare ?? 0.02)
+          ) {
+            leg.lastPairCompleteMs = Date.now();
+            const ok = await marketFlatten(leg.tokenId, 'BUY', completeShares, bestAsk);
+            if (ok) pairCompleteCount++;
+            logEvent({
+              kind: 'pair_complete',
+              token: leg.tokenId,
+              leg: leg.label,
+              excessShares: excessOnOther,
+              completeShares,
+              askPrice: bestAsk,
+              otherLegAvgCost,
+              feePerShare,
+              lockedProfit,
+              ok,
+            });
+            logger.info({ leg: leg.label, completeShares, askPrice: bestAsk, lockedProfit, ok }, 'taker pair-completion');
+          }
+        }
 
         // UN-HEDGEABLE OPENING GUARD (2026-05-30). The bot only buys the cheap side
         // (<= max_buy_price). In a directional move one leg is the cheap UNDERDOG and
@@ -1290,6 +1428,42 @@ async function main(): Promise<void> {
         windowPnl,
         unresolvedDeferredUsd,
       });
+    }
+
+    // FAVORITE HARVESTER shadow result. Score the harvest entry on the actual
+    // settle: hypoPnl = (won ? 1 : 0 - ask - takerFee) * shares. In dry-run this
+    // is the ONLY P&L track (no real fills moved the account); in live it cross-
+    // checks the real number. Only counted when the window resolved decisively.
+    if (cfg.maker.favoriteHarvester && harvestIntent) {
+      const hi = harvestIntent;
+      const wonSide = res ? (hi.leg === 'YES' ? res.yesWon : !res.yesWon) : null;
+      const fee = cfg.maker.takerFeeRate * hi.ask * (1 - hi.ask);
+      const hypoPnl = wonSide == null ? null : ((wonSide ? 1 : 0) - hi.ask - fee) * hi.shares;
+      if (hypoPnl != null) {
+        harvestShadowUsd += hypoPnl;
+        harvestEntries++;
+        if (wonSide) harvestWins++;
+      }
+      logEvent({
+        kind: 'harvest_result',
+        token: hi.tokenId,
+        leg: hi.leg,
+        ask: hi.ask,
+        shares: hi.shares,
+        mid: hi.mid,
+        entryTtrSec: Math.round(hi.ttrSec),
+        yesWon: res ? res.yesWon : null,
+        wonSide,
+        hypoPnl,
+        harvestShadowUsd,
+        harvestEntries,
+        harvestWins,
+        dryRun: !enabled,
+      });
+      logger.info(
+        { leg: hi.leg, ask: hi.ask, wonSide, hypoPnl: hypoPnl != null ? Number(hypoPnl.toFixed(3)) : null, harvestShadowUsd: Number(harvestShadowUsd.toFixed(2)) },
+        'harvest result (shadow P&L)',
+      );
     }
 
     // Wallet cross-check AT window close (best-effort), captured BEFORE the

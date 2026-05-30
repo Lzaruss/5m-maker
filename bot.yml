@@ -1,216 +1,100 @@
-# 5m-maker configuration. Conservative defaults for the validation phase.
-# Tune `maker.half_spread` and the adverse_guard thresholds from real tapes
-# via `npm run simulate` before trusting these for a live bot.
+# Favorite Harvester configuration — strategy redesign 2026-05-30.
+#
+# The matched-pair maker had no edge (adverse selection: you only fill the losing
+# side — proven live over 4 negative sessions). A 2-day tape study (scripts/
+# lag-study.ts + favorite-maker-sim.ts) killed the directional/lag taker too (the
+# market is efficient) but found ONE edge that survives fees: the favorite-
+# longshot bias, harvested as a TAKER. Late in each window we cross the spread to
+# BUY the book's FAVORITE (mid >= 0.60) and HOLD to resolution. Validated +EV on
+# the less-efficient books (DOGE +8-13% ROI, XRP +6-7%, day-stable); negative on
+# the efficient majors (BNB/ETH — tight spreads eat the bias) so they are excluded.
+#
+# PAPER MODE is controlled by `live.enabled` below (false = no real orders). In
+# paper mode the harvester logs intended taker buys and scores them on the real
+# settle (harvest_result.hypoPnl / summary.harvestShadowUsd) without placing
+# orders — a live shadow-backtest. Watch harvestShadowUsd trend up.
 
 assets: [BTC, ETH, SOL, XRP, BNB, DOGE]
 
 maker:
-  # === Rebalance 2026-05-27 morning ===
-  # Previous tightening combo (half_spread 0.05 + adverse pull 0.0004 + spend
-  # cap 3 + inv cap 2 + max_buy 0.5) froze the bot: 4 places in 12 min, 25%
-  # of reconciles in `both_sides_pulled`. Reopening selectively while KEEPING
-  # the structural max_buy_price fix and tight loss caps.
-  # === half_spread re-grounded in microstructure 2026-05-28 ===
-  # Rule: half_spread must be ~0.5x the LIVE book spread to be competitive. Quote
-  # wider than the book's half-spread and your bid sits BEHIND best bid — the only
-  # way it fills is the price moving that far to reach you, i.e. informed/adverse
-  # flow (this is why BTC fills won 5-24% to resolution). Tape medians: BTC 1c
-  # (untradeable for a maker), but BNB ~7c and DOGE ~6c. 0.03 sits inside/at the
-  # best bid on those alts -> fills on noise (mean-reverting), not on crashes.
-  # Edge per matched pair = 2 x half_spread ~= $0.06. If alt fills dry up, this is
-  # the FIRST lever (alts are 2-3x more volatile, so the BTC-tuned adverse_guard
-  # below may already be pulling a lot). Do NOT raise above the chosen asset's
-  # half-spread or every fill becomes adverse again.
-  half_spread: 0.03            # was 0.06 (BTC); 0.03 is competitive for BNB/DOGE 6-7c books
-  # === Per-asset half_spread (2026-05-29, breadth for the rebate farm) ===
-  # Rule (microstructure + two-leg backtest): half_spread ≈ 0.5× the asset's BOOK
-  # spread, or the bid sits behind the touch and only fills adversely. Tape
-  # medians: BNB/DOGE ~6c → 0.03 (global); XRP ~3c → 0.015; SOL ~2c → 0.01.
-  # In the two-leg backtest, matching the spread to the book LIFTED both-leg fills
-  # massively (XRP 0%→11%, SOL→17% vs BNB/DOGE 2% at the wrong spread) — the
-  # lowest-competition books (XRP depth ~10, SOL ~16) hedge best when quoted
-  # competitively. Assets not listed use `half_spread`. ETH/BTC excluded (1c books
-  # untradeable for a maker). More independent markets ⇒ variance ∝1/√N at the
-  # SAME globally-bounded capital (max_deployed_usd is a cross-asset sum).
+  # ── FAVORITE HARVESTER (active strategy) ──────────────────────────────────
+  favorite_harvester: true
+  # Begin hunting for a favorite in the last 90s; stop entering at 30s-to-go
+  # (matches the backtest's best T_enter band of 90-60s on a 5-minute window).
+  harvest_enter_sec: 90
+  harvest_exit_sec: 30
+  # A leg is the favorite when mid >= this. 0.60 = conviction 10% (the backtest's
+  # most robust threshold across both days/assets).
+  harvest_min_mid: 0.60
+  # Never pay an ask above this. The favorite-bias EV per trade is ~constant with
+  # price (the bias gap), but VARIANCE explodes at high ask: a flip at 0.88 loses
+  # -0.88 while a win pays only +0.12. The first live batch (2026-05-30) lost on
+  # exactly two expensive-favorite flips (0.88, 0.73) that wiped 8 small wins.
+  # Lowered 0.90 -> 0.85 to cut the blow-up trades for negligible EV loss
+  # (recomputed: that batch flips from -$1.50 to +$1.44).
+  harvest_max_ask: 0.85
+  # Taker clip per harvest entry. 5 sh ≈ $4/window/asset; with 1 entry/window and
+  # 2 assets the bot risks at most ~$8 concurrently. Bounded by design.
+  harvest_clip_shares: 5
+
+  # ── Shared knobs (still parsed; the maker quote/flatten phases are bypassed
+  #    while favorite_harvester is true, so these only matter if you flip back) ──
+  half_spread: 0.03
   half_spread_by_asset:
     XRP: 0.015
     SOL: 0.01
-  quote_size_usd: 1.0         # unchanged
-  min_quote_shares: 5.0        # Polymarket min_order_size floor
-  inventory_skew_k: 0.2        # gentle skew — keeps SELL from going fire-sale
-  widen_factor: 2.5            # widen on volatility
-  # Per-leg DOLLAR exposure cap (now enforced ON-CHAIN-AWARE, 2026-05-30). The
-  # gate suppresses ALL buys on a leg once its real holdings × mid reach this. 3.0
-  # ≈ one 5-share clip of headroom, bounding worst-case directional loss to ~$3/leg
-  # per window. Was 4 but enforced on lagged tracked shares, so a fill burst (4-30s
-  # /activity lag) ran a leg to 20 shares before it bit. Raise once pairs prove out.
+  quote_size_usd: 1.0
+  min_quote_shares: 5.0            # venue min_order_size floor (also the harvest min clip)
+  inventory_skew_k: 0.2
+  widen_factor: 2.5
   max_inventory_usd: 3
-  tick_size: 0.01              # price granularity for rounding quotes
-
-  # ── Strategy mode ─────────────────────────────────────────────────────────
-  # SELL re-enabled (2026-05-27 rebalance). The fire-sale risk is now prevented
-  # structurally by max_buy_price, hedge cap, and spend cap — not by disabling
-  # the SELL side entirely. Keeping disable_sell=true was turning the bot into
-  # a pure lottery (BUY only, hold to resolution) rather than a market-maker.
+  tick_size: 0.01
   disable_sell: false
-
-  # ── Control knobs ────────────────────────────────────────────────────────
-  quote_price_min: 0.05       # refuse to quote below this price (no lottery-ticket BUYs)
-  quote_price_max: 0.95        # refuse to quote above this price (no extreme SELLs)
-  # === STRUCTURAL EDGE FIX (2026-05-27) ===
-  # Empirical analysis: 64% of overnight losses came from BUYs at price > 0.5.
-  # At p=0.65, R/R is 0.54:1 (needs 65% win rate; we have no directional info).
-  # Restricting BUYs to the "underdog" side (price <= 0.5) keeps R/R >= 1:1
-  # on every entry. Asymmetric — does NOT affect SELL placement.
-  max_buy_price: 0.50          # never post BUY above this price (STRUCTURAL FIX, keep)
-  # COHERENCE (2026-05-30): max_unmatched_shares MUST be >= min_quote_shares (5).
-  # The BUY clip can't be smaller than the venue's 5-share minimum, so a cap below
-  # 5 can never fit a single clip — the size-clamp then drops EVERY opening BUY and
-  # the bot places 0 orders (observed: 3 windows, 0 trades at cap=3). 5 = exactly
-  # one unmatched clip of directional exposure per leg (~$1.5-2.5 max loss/window).
+  quote_price_min: 0.05
+  quote_price_max: 0.95
+  max_buy_price: 0.50
   max_unmatched_shares: 5
-  max_spend_per_leg_usd: 8     # ↑ from 3 — was hitting cap in 30s and going idle
-  # ↑ 3→4 (2026-05-28): 59-274 reconciles per fill in the logs. A wider deadband
-  # cuts cancel+replace churn AND the cancel-fill races that let inventory drift
-  # past the hedge cap (the imbalance-blowout signature). Quotes go slightly more
-  # stale — negligible vs the race risk.
-  replace_deadband_ticks: 4    # only cancel+replace if desired moved >= this many ticks
-
-  # ── Even-money pair guarantee (2026-05-29) ───────────────────────────────
-  # The hedge-BUY ceiling is now DYNAMIC:
-  #   hedgeCeiling = min(0.85, 1.0 - otherLegAvgCost - min_pair_profit_per_share)
-  # At 0.02, before completing a YES+NO pair the bot verifies the second leg
-  # can be bought such that total pair cost <= $0.98 -> locked-in >= $0.02
-  # profit regardless of outcome. Prevents the fixed-ceiling bug where a
-  # market move after the first fill could produce pair_cost > $1 (guaranteed
-  # loss). Set to 0 to revert to the old fixed-ceiling behaviour.
+  max_spend_per_leg_usd: 8
+  replace_deadband_ticks: 4
   min_pair_profit_per_share: 0.02
-
-
-  # All suppress OPENING new directional risk in low-edge/toxic conditions but
-  # never block de-risking (hedge-completion BUYs are exempt; the unwind SELL is
-  # untouched). Set any to 0 to disable.
-  # No-trade dead zone around 0.50. DISABLED 2026-05-30: the new un-hedgeable
-  # opening guard restricts OPENING to exactly the near-50/50 zone (where BOTH legs
-  # are <= max_buy_price, so the pair can complete). This band blocked that same
-  # zone, so the two together left the bot unable to open at all. Near-50 is in fact
-  # where the maker EDGE lives: buying both legs at the BID gives pair cost
-  # 1 - 2*half_spread < 1 (the dead-zone comment confused mid-cost with bid-cost).
+  taker_complete: false           # legacy pair-maker feature; off under the harvester
   no_trade_band_50: 0
-  # Stop OPENING inside the last 90s — late entries are adversely selected (late
-  # buys won 0-17% vs ~40% baseline). Must be > flatten_before_sec (30) so there
-  # is a de-risk-only window. Hedge-completion + unwind still run.
   no_new_entry_before_sec: 90
-  # Volatility hard-pause: |assetReturn30s| >= this => no_quote BOTH sides (cancel
-  # resting, stand aside). Set ABOVE adverse_guard.pull (0.0010). 0.0025 = a
-  # violent 0.25%/30s move. NOTE: alts are more volatile than BTC — if this fires
-  # too often on BNB/DOGE, raise it (toward 0.004) rather than disabling.
   vol_halt_return_30s: 0.0025
-  # Minimum top-of-book depth (shares) on BOTH sides to quote. Thin books gap on
-  # a single taker and pick off resting quotes. Conservative; raise if alt books
-  # are routinely thin and this starves fills.
   min_book_depth_shares: 0
-
   adverse_guard:
-    # Relaxed from the over-tight 0.0002/0.0004 that was triggering on every
-    # BTC vibration. BTC routinely moves 0.05-0.10% in 30s, so 0.04% pull
-    # threshold was pulling ~25% of the time. New values are a compromise
-    # between the original loose 0.0005/0.0010 and the over-tight new ones.
-    btc_return_30s_widen: 0.0005  # widen at 0.03% in 30s
-    btc_return_30s_pull: 0.0020   # pull at 0.06% in 30s
-
-  flatten_before_sec: 30       # boundary where we cancel resting BUYs and (unless disable_sell) market-flatten residual
-  # === Flatten threshold raised 2026-05-28 (profitability) ===
-  # At 0.03 the bot tried to market-flatten ALMOST ANY residual at close. With
-  # auto-redeem ON, that's a pure leak: in an efficient market price == win
-  # probability, so flattening at price p has the SAME expected value as holding
-  # to a 0/1 settlement — minus the taker fee. The overnight logs confirmed it:
-  # 785 flatten_skip vs 78 executed (most rode to redeem anyway) and the
-  # executed ones occasionally sold winners at 0.9 instead of redeeming at 1.0.
-  # With the hedge cap now bounding unmatched exposure to ~3 shares (~$3), the
-  # residual that rides to resolution is tiny and diversifies across windows.
-  # We only market-flatten genuinely large unhedged positions (safety valve);
-  # resting BUYs are still cancelled at the boundary regardless of this value.
+    btc_return_30s_widen: 0.0005
+    btc_return_30s_pull: 0.0020
+  flatten_before_sec: 30
   flatten_if_net_above_usd: 5.0
 
-  # ── Simulator realism knobs (ignored by the live bot) ────────────────────
-  fill_participation: 1.0      # fraction of a crossing trade we capture (queue proxy); lower = more conservative
-  taker_fee_rate: 0.07         # crypto fee rate; taker fee USDC = shares*rate*p*(1-p) (~1.8% at p=0.5). Makers pay 0; hits flatten orders.
+  # Taker fee schedule (real Polymarket: shares * rate * p*(1-p)). Drives the
+  # harvest_max_ask room calc and the shadow-P&L fee deduction.
+  fill_participation: 1.0
+  taker_fee_rate: 0.07
 
 risk:
-  daily_loss_limit_usd: 15.0   # used by the future live bot only
-  max_committed_usd: 12.0      # max capital resting in live orders (live bot only)
+  daily_loss_limit_usd: 15.0
+  max_committed_usd: 12.0
 
 live:
-  enabled: true           # real money — kill switch is `npm run cancel-all`
-  # === Asset switch 2026-05-28 (microstructure) ===
-  # DROPPED BTC. Tape (17.5h): BTC median spread 1c with ~2000sh competing depth
-  # = ~2.5% reward share and no maker edge (a 1c-spread market can't support a
-  # tradeable half_spread). BNB (~7c spread, ~210sh) and DOGE (~6c, ~270sh) give
-  # 6-7x more spread and ~8x less competition (~16-19% reward share). This is the
-  # single highest-EV change. NOTE: not yet validated for two-leg fill-rate/PnL —
-  # run with eyes on the first session; the session/net-worth halts below are the
-  # backstop. adverse_guard is BTC-tuned; alts are more volatile (watch fill rate).
-  # === Single-asset test mode 2026-05-28 ===
-  # Limited to ONE asset (BNB) for the validation phase: halves concurrent capital
-  # at risk, gives clean attribution, and the global caps below now bound a single
-  # market. BNB chosen over DOGE: widest tape spread (7c vs 6c) + lowest competing
-  # depth (~210 vs ~270 sh) = best per-fill maker edge. Add DOGE back once a
-  # session proves out. Two assets is NOT required — it only diversifies variance,
-  # and BNB/DOGE are correlated (both crypto) so the benefit is small.
-  # === Breadth for the rebate farm (2026-05-29) ===
-  # Was [DOGE] single-asset. The rebate (0.61% of notional) is variance-dominated
-  # at low volume; more INDEPENDENT 5m markets cut the variance of the average
-  # (∝1/√N) so the rebate edge emerges faster — at the SAME bounded capital (the
-  # max_deployed_usd cap below is a global cross-asset sum, NOT per-asset). Assets
-  # chosen by book width + competition (see half_spread_by_asset): BNB/DOGE (6c),
-  # XRP (3c, lowest competition), SOL (2c, filled best in backtest). ETH/BTC
-  # excluded — 1c books are untradeable for a small maker.
-  # Two assets for the validation run: XRP (lowest competition) + SOL (filled best
-  # in the two-leg backtest, 17%). Both have tuned half_spread_by_asset. Breadth
-  # gives enough matched-pair fills to actually VALIDATE the 2026-05-29/30 fixes,
-  # while max_deployed_usd below (a cross-asset SUM) keeps total capital bounded.
-  assets: [SOL]
-  max_deployed_usd: 18     # cross-asset SUM ≈ max_spend_per_leg (8) × 2 legs + headroom
-  # Loss caps KEPT TIGHT — we want to detect any new leak with the on-chain
-  # reconciler ASAP. Don't raise these until 12h of clean operation.
-  daily_loss_halt_usd: 5  # idle until 00:00 UTC after $2 realized loss
-  session_loss_halt_usd: 10  # EXIT process after $10 cumulative realized loss since start
-  poll_interval_ms: 750     # ↓ from 1500 (2× faster ticks; HTTP calls now batched/parallel so total latency fits)
-  # === Reconcile cadence tightened 2026-05-28 ===
-  # Overnight the /activity fill feed double-counted fills (unstable trade ids),
-  # letting tracked inventory drift to ~71 vs 38 on-chain before the reconcile
-  # corrected it. In that window the hedge/spend caps acted on garbage and
-  # positions grew to 30-40 shares (8x the 5-share cap). 10s shrinks the drift
-  # window 3x; the deriveTradeId fix removes the double-count at source.
-  reconcile_every_sec: 2   # ↓ from 4 (2026-05-30): fills arrive in <4s bursts that
-                           # the cap couldn't see between reconciles (a leg ran to 15
-                           # sh in one burst). 2s halves that blind window. lastOnchain
-                           # shares/cost feed the on-chain-aware inventory + hedge caps.
-  reconcile_correct: true   # snap tracked shares to on-chain truth on drift (false = log-only)
-  # Debounce (2026-05-29): /activity fills lag the chain ~15-60s. Snapping on the
-  # FIRST detection, then applying the lagging fill on top, double-counts shares
-  # (NO leg reached 43.3 tracked vs 21.7 on-chain → inflated -$7.25 PnL + a false
-  # halt at -$2 real). Only correct a drift that has persisted continuously this
-  # long; shorter drift self-closes when the fill lands. Keep > worst-case lag.
+  # ⚠️ THIS is the real-vs-paper switch (NOT the DRY_RUN env var, which only gets
+  # logged and does NOT gate orders). enabled:true = REAL on-chain orders.
+  # enabled:false = paper: the loop runs and logs harvest intent + shadow P&L but
+  # places NO orders. Set to true ONLY when you deliberately want live trading.
+  enabled: true
+  # Only the assets where the favorite-bias survived the taker cross (validated
+  # 2-day, day-stable). BNB/ETH excluded (negative after fees); SOL/BTC marginal.
+  assets: [DOGE, XRP]
+  max_deployed_usd: 20
+  daily_loss_halt_usd: 5
+  session_loss_halt_usd: 10
+  poll_interval_ms: 750
+  reconcile_every_sec: 2
+  reconcile_correct: true
   reconcile_min_persist_ms: 60000
-  # Cash-floor circuit breaker (2026-05-28). Winners auto-redeem at the account
-  # level, so a falling balance is REAL losses, not locked capital. Overnight the
-  # balance fell $25 — oversized directional positions (from the tracking bug
-  # that bypassed the 5-share hedge cap) losing at resolution. Below this floor
-  # we stop opening BUYs (SELL/flatten stay on) so a losing streak can't drain
-  # the bank to zero before the daily/session halts catch it.
-  cash_floor_usd: 20
-  # Net-worth drawdown halt (2026-05-28). The daily/session halts above trust the
-  # INTERNAL mark tracker; this one reads the WALLET directly (cash + held token
-  # value via getAccountValue, checked every 90s) and hard-exits if real net
-  # worth falls this much from the start balance. It would have caught the
-  # overnight bleed regardless of the +$117 mark illusion. Catastrophe backstop —
-  # set WIDER than session_loss_halt so the mark-based halts trip first in normal
-  # operation; this only fires if the internal accounting is lying.
+  cash_floor_usd: 5
   net_worth_halt_usd: 15
-  # ── Session stop limits ────────────────────────────────────────────────────
-  # All three pause until 00:00 UTC (same as daily_loss_halt). 0 = disabled.
-  session_max_windows: 5        # stop after N resolved windows (0 = no limit)
-  session_take_profit_usd: 0     # lock in gains when session profit >= this (0 = disabled)
-  session_max_consec_losses: 3   # pause after 3 consecutive losing windows (0 = disabled)
+  session_max_windows: 30
+  session_take_profit_usd: 0
+  session_max_consec_losses: 0     # disabled: dry-run books no realized losses (shadow only)

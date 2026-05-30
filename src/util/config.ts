@@ -103,6 +103,30 @@ export interface MakerConfig {
    *  the matched pair must cost <= $0.98 to be accepted. Set to 0 to revert to
    *  the old fixed HEDGE_BUY_PRICE_CEILING behaviour. */
   minPairProfitPerShare: number;
+  /** Opportunistic TAKER pair-completion (2026-05-30). When one leg is filled and
+   *  the other leg's ASK is cheap enough that completing the pair via a taker BUY
+   *  still locks >= minPairProfitPerShare AFTER taker fees, cross the spread to
+   *  complete it — turning a naked excess into a guaranteed-profit matched pair.
+   *  The only reliable way to complete a pair when passive fills are one-sided
+   *  (the 2026-05-30 adverse-selection problem). Fires only when profitable. */
+  takerComplete: boolean;
+  // ── Favorite Harvester (2026-05-30 strategy redesign) ─────────────────────
+  /** Enable the Favorite Harvester: a TAKER that, late in each window, crosses
+   *  the spread to BUY the book's FAVORITE (mid >= harvestMinMid) and HOLDS to
+   *  resolution. Validated +EV after fees on the less-efficient books (DOGE/XRP)
+   *  via the favorite-longshot bias. When true the matched-pair maker quote +
+   *  flatten phases are bypassed entirely (the harvester holds, never sells). */
+  favoriteHarvester: boolean;
+  /** Begin hunting for a favorite once timeToResolve <= this (seconds). */
+  harvestEnterSec: number;
+  /** Stop entering once timeToResolve < this (too little edge room near close). */
+  harvestExitSec: number;
+  /** A leg is the "favorite" when its mid >= this (0.60 ≈ conviction 10%). */
+  harvestMinMid: number;
+  /** Never pay an ask above this for the favorite (no room to $1 after fee). */
+  harvestMaxAsk: number;
+  /** Taker clip size (shares) for the harvest entry. */
+  harvestClipShares: number;
   /** Simulator only: fraction of a crossing trade's size we assume to capture
    *  (queue-position proxy). 1.0 = front-of-line on the whole print. */
   fillParticipation: number;
@@ -230,6 +254,13 @@ export function parseBotYaml(raw: string): BotConfig {
     minBookDepthShares: m.min_book_depth_shares ?? 20,
     pegToTouch: m.peg_to_touch === true,
     minPairProfitPerShare: m.min_pair_profit_per_share ?? 0.02,
+    takerComplete: m.taker_complete ?? false,
+    favoriteHarvester: m.favorite_harvester ?? false,
+    harvestEnterSec: m.harvest_enter_sec ?? 90,
+    harvestExitSec: m.harvest_exit_sec ?? 30,
+    harvestMinMid: m.harvest_min_mid ?? 0.60,
+    harvestMaxAsk: m.harvest_max_ask ?? 0.90,
+    harvestClipShares: m.harvest_clip_shares ?? 5,
     fillParticipation: m.fill_participation ?? 1.0,
     // Accept new key `taker_fee_rate` (0.07) or fall back to the legacy
     // `taker_fee_max` if an old bot.yml is still in use.
