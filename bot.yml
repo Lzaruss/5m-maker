@@ -1,40 +1,57 @@
-# Favorite Harvester configuration — strategy redesign 2026-05-30.
+# Momentum-Trend configuration — strategy redesign 2026-05-31.
 #
-# The matched-pair maker had no edge (adverse selection: you only fill the losing
-# side — proven live over 4 negative sessions). A 2-day tape study (scripts/
-# lag-study.ts + favorite-maker-sim.ts) killed the directional/lag taker too (the
-# market is efficient) but found ONE edge that survives fees: the favorite-
-# longshot bias, harvested as a TAKER. Late in each window we cross the spread to
-# BUY the book's FAVORITE (mid >= 0.60) and HOLD to resolution. Validated +EV on
-# the less-efficient books (DOGE +8-13% ROI, XRP +6-7%, day-stable); negative on
-# the efficient majors (BNB/ETH — tight spreads eat the bias) so they are excluded.
+# Path so far: matched-pair maker (no edge, adverse selection) → favorite-harvester
+# (favorite-longshot bias; +EV on tape but win%≈price live, did NOT replicate) →
+# MOMENTUM-TREND (this). A 2-day tape study (scripts/momentum-yes-sim.ts) found
+# 5-min crypto windows autocorrelate strongly: prior-300s up → window finishes UP
+# ~64% (vs 49.8% base), down → ~35%. The fresh window's book opens ~50/50 before
+# pricing that continuation, so entering EARLY (~270s) and betting WITH the trend
+# (up→YES, down→NO), held to resolution, is +EV. Validated +9-10% ROI on BOTH days
+# and ALL 6 assets (win 59-71%). This is the inverse of the harvester's failure:
+# we enter EARLY (book not yet efficient, win% >> price) instead of late.
 #
-# PAPER MODE is controlled by `live.enabled` below (false = no real orders). In
-# paper mode the harvester logs intended taker buys and scores them on the real
-# settle (harvest_result.hypoPnl / summary.harvestShadowUsd) without placing
-# orders — a live shadow-backtest. Watch harvestShadowUsd trend up.
+# ⚠️ LIVE (real money) per user decision 2026-05-31. Risk is bounded by clip size
+# + daily/session halts. NOTE: the momentum signal needs ~4 min of price history
+# after launch before it fires (the 300s buffer must fill).
+#
+# `live.enabled` below is the real-vs-paper switch (NOT the DRY_RUN env var).
 
 assets: [BTC, ETH, SOL, XRP, BNB, DOGE]
 
 maker:
-  # ── FAVORITE HARVESTER (active strategy) ──────────────────────────────────
-  favorite_harvester: true
-  # Begin hunting for a favorite in the last 90s; stop entering at 30s-to-go
-  # (matches the backtest's best T_enter band of 90-60s on a 5-minute window).
+  # ── MOMENTUM-TREND (active strategy) ──────────────────────────────────────
+  momentum_trend: true
+  # Enter just after the window opens (~270s to resolve on a 5-min window). The
+  # signal is the prior-window move; the fresh book hasn't priced it yet.
+  momentum_enter_sec: 270
+  # Floor — stop entering once the signal stales late in the window.
+  momentum_exit_sec: 120
+  # Lookback for the underlying momentum signal. 300s (one prior window) was the
+  # day-stable sweet spot; 120s and 600s were NOT stable (one day negative).
+  momentum_lookback_sec: 300
+  # |prior return| must exceed this to take a side. 0.10%: the 0.05-0.10% bucket
+  # was NOISE (53% win, -EV) on BOTH tape days and dragged the strategy down;
+  # >=0.10% won 68-77%. Raising 0.05%->0.10% lifts ROI ~+9.5% -> ~+16% (validated).
+  momentum_threshold: 0.0010
+  # Conviction sizing: win% rises with the move (68%->77% as |r| grows), so size up
+  # 2x on strong signals (>=0.20%). Bounded by ask depth + max_deployed.
+  momentum_strong_threshold: 0.0020
+  momentum_strong_mult: 2
+  # BOTH directions (user pref 2026-05-31): YES on uptrends, NO on downtrends —
+  # trade WITH the trend either way. The DOWN half is the better-performing half on
+  # the tape (BTC both-sides +10% ROI vs long-only +6.2%), so keeping it is correct.
+  momentum_long_only: false
+  # Don't chase: past ~0.80 the book has already priced the move (edge gone).
+  momentum_max_ask: 0.80
+  # Base taker clip (5 sh = venue min ≈ $2.6/window/asset at ~0.52 entry; 10 on strong).
+  momentum_clip_shares: 5
+
+  # ── FAVORITE HARVESTER (legacy, disabled — superseded by momentum_trend) ──
+  favorite_harvester: false
   harvest_enter_sec: 90
   harvest_exit_sec: 30
-  # A leg is the favorite when mid >= this. 0.60 = conviction 10% (the backtest's
-  # most robust threshold across both days/assets).
   harvest_min_mid: 0.60
-  # Never pay an ask above this. The favorite-bias EV per trade is ~constant with
-  # price (the bias gap), but VARIANCE explodes at high ask: a flip at 0.88 loses
-  # -0.88 while a win pays only +0.12. The first live batch (2026-05-30) lost on
-  # exactly two expensive-favorite flips (0.88, 0.73) that wiped 8 small wins.
-  # Lowered 0.90 -> 0.85 to cut the blow-up trades for negligible EV loss
-  # (recomputed: that batch flips from -$1.50 to +$1.44).
   harvest_max_ask: 0.85
-  # Taker clip per harvest entry. 5 sh ≈ $4/window/asset; with 1 entry/window and
-  # 2 assets the bot risks at most ~$8 concurrently. Bounded by design.
   harvest_clip_shares: 5
 
   # ── Shared knobs (still parsed; the maker quote/flatten phases are bypassed
@@ -83,18 +100,26 @@ live:
   # enabled:false = paper: the loop runs and logs harvest intent + shadow P&L but
   # places NO orders. Set to true ONLY when you deliberately want live trading.
   enabled: true
-  # Only the assets where the favorite-bias survived the taker cross (validated
-  # 2-day, day-stable). BNB/ETH excluded (negative after fees); SOL/BTC marginal.
-  assets: [DOGE, XRP]
-  max_deployed_usd: 20
-  daily_loss_halt_usd: 5
-  session_loss_halt_usd: 10
+  # BTC only for now (user pref 2026-05-31, one asset at a time). NOTE: in the tape
+  # BTC was the WEAKEST of the 6 (+6.2% long-only vs +17% pooled), and a single
+  # asset = no diversification = higher variance (~10-12 windows/hr, fewer with
+  # long-only). Add ETH/XRP/SOL later for a smoother curve.
+  assets: [BTC]
+  # 1 asset × up to 10 sh (strong) × ~$0.55 ≈ $5.5; 10 gives headroom.
+  max_deployed_usd: 10
+  # ⚠️ HALT SIZING TRADEOFF: each loss is ~$2.6 (5 sh × ~0.52). The strategy wins
+  # ~65% but has variance — a $5 halt would trip on 2 normal early losses and never
+  # let the edge compound. $10 daily / $20 session gives room to ride variance while
+  # bounding the downside. Raise/lower to YOUR risk tolerance.
+  daily_loss_halt_usd: 10
+  session_loss_halt_usd: 20
   poll_interval_ms: 750
   reconcile_every_sec: 2
   reconcile_correct: true
   reconcile_min_persist_ms: 60000
   cash_floor_usd: 5
-  net_worth_halt_usd: 15
-  session_max_windows: 30
+  net_worth_halt_usd: 30
+  # ~50 resolved windows ≈ 8/asset — a meaningful batch to judge the live edge.
+  session_max_windows: 50
   session_take_profit_usd: 0
-  session_max_consec_losses: 0     # disabled: dry-run books no realized losses (shadow only)
+  session_max_consec_losses: 0     # disabled: momentum clusters losses in choppy patches; rely on $ halts

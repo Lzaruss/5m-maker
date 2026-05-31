@@ -16,8 +16,15 @@ interface PricePoint {
 export class PriceFeed {
   private ws: WebSocket | null = null;
   private buffers = new Map<Asset, PricePoint[]>();
-  private readonly maxAgeMs = 70_000;
+  private readonly maxAgeMs: number;
   private reconnectDelay = 1000;
+
+  /** @param maxAgeMs rolling buffer length. Default 70s (enough for the 30s
+   *  adverse-guard return). The momentum strategy needs a 300s lookback, so the
+   *  live bot constructs this with ~360s to cover it (see src/index.ts). */
+  constructor(maxAgeMs = 70_000) {
+    this.maxAgeMs = maxAgeMs;
+  }
   private assets: Asset[] = [];
   private tickCounts = new Map<Asset, number>();
   private stopped = false;

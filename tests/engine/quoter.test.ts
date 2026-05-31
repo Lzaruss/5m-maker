@@ -30,6 +30,16 @@ const cfg: MakerConfig = {
   harvestMinMid: 0.6,
   harvestMaxAsk: 0.9,
   harvestClipShares: 5,
+  momentumTrend: false,
+  momentumEnterSec: 270,
+  momentumExitSec: 120,
+  momentumLookbackSec: 300,
+  momentumThreshold: 0.001,
+  momentumStrongThreshold: 0.002,
+  momentumStrongMult: 2,
+  momentumLongOnly: false,
+  momentumMaxAsk: 0.8,
+  momentumClipShares: 5,
   // Tier-2 gates DISABLED in the base fixture so the original tests are
   // unaffected; each gate test below enables exactly what it exercises.
   noTradeBand50: 0,

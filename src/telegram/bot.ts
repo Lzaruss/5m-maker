@@ -25,9 +25,3 @@ export function createBot(deps: TelegramDeps): TelegramBot | null {
 export function isAuthorized(chatId: string | number, allowed: string): boolean {
   return String(chatId) === String(allowed);
 }
-
-/** Escape MarkdownV2 reserved characters so user-provided strings don't break
- *  formatting. We only use plain Markdown so this is a soft helper. */
-export function escapeMd(text: string): string {
-  return String(text).replace(/([_*[\]()~`>#+=|{}.!\\-])/g, '\\$1');
-}

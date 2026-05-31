@@ -48,15 +48,6 @@ export async function getOpenPositions(): Promise<ClobPosition[]> {
     .filter((p: ClobPosition) => p.size > 0);
 }
 
-/**
- * Find a specific position by tokenId. Returns null if not in the list
- * (which means either never held, already redeemed, or lost on resolution).
- */
-export async function findPosition(tokenId: string): Promise<ClobPosition | null> {
-  const positions = await getOpenPositions();
-  return positions.find((p) => p.tokenId === tokenId) ?? null;
-}
-
 export interface AccountValue {
   /** Liquid USDC in the wallet. */
   cashUsd: number;
@@ -100,45 +91,4 @@ export async function getAccountValue(): Promise<AccountValue> {
     redeemableCount,
     positions,
   };
-}
-
-export interface RedeemEvent {
-  conditionId: string;
-  size: number;
-  usdcSize: number;
-  timestamp: number;
-}
-
-/**
- * Check the user's recent activity for a REDEEM event matching a conditionId.
- *
- * Polymarket only allows redemption of WINNING shares — a REDEEM event
- * with size > 0 after the market resolved means we won. Without this
- * check, "position absent from /positions" is ambiguous between
- * "lost (worthless shares pruned)" and "won + already redeemed".
- *
- * IMPORTANT: REDEEM events in the activity API have `asset: ''` (empty),
- * so we match by `conditionId` instead. That's why OpenPosition tracks
- * `conditionId` alongside `tokenId`.
- */
-export async function findRedeem(conditionId: string, afterMs = 0): Promise<RedeemEvent | null> {
-  const env = loadEnv();
-  const url = `${DATA_API}/activity?user=${env.clobFunderAddress}&limit=100`;
-  const response = await axios.get(url, { timeout: 10_000 });
-  const arr: any[] = Array.isArray(response.data) ? response.data : [];
-  for (const a of arr) {
-    if (String(a.type ?? '').toUpperCase() !== 'REDEEM') continue;
-    if (String(a.conditionId ?? '') !== conditionId) continue;
-    const size = Number(a.size ?? 0);
-    if (size <= 0) continue; // noop redeems with size=0 — ignore
-    const ts = Number(a.timestamp ?? 0) * 1000;
-    if (ts < afterMs - 5 * 60_000) continue;
-    return {
-      conditionId,
-      size,
-      usdcSize: Number(a.usdcSize ?? size),
-      timestamp: ts,
-    };
-  }
-  return null;
 }

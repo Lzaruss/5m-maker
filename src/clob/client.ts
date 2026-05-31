@@ -44,7 +44,3 @@ export async function getUsdcBalance(): Promise<number> {
   const raw = Number(result?.balance ?? result?.allowance ?? 0);
   return raw / 1_000_000;
 }
-
-export function resetClobClient(): void {
-  _client = null;
-}

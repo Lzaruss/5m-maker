@@ -127,6 +127,34 @@ export interface MakerConfig {
   harvestMaxAsk: number;
   /** Taker clip size (shares) for the harvest entry. */
   harvestClipShares: number;
+  // ── Momentum-trend strategy (2026-05-31, validated on 2-day tape) ─────────
+  /** Enable the momentum-trend taker: at ~momentumEnterSec into each window read
+   *  the underlying's prior-`momentumLookbackSec` return; if it rose buy YES, if it
+   *  fell buy NO (trade WITH the trend), hold to resolution. 5-min crypto windows
+   *  autocorrelate (prior-300s up → window finishes UP ~64%), and the new window's
+   *  book opens ~50/50 before pricing it → entering early is +EV. Validated +9-10%
+   *  ROI both days, all 6 assets. Bypasses the maker quote/flatten phases like the
+   *  harvester. Mutually exclusive with favoriteHarvester. */
+  momentumTrend: boolean;
+  /** Look for the entry once timeToResolve <= this (just after the window opens). */
+  momentumEnterSec: number;
+  /** Floor: stop entering once timeToResolve < this (signal stales late-window). */
+  momentumExitSec: number;
+  /** Lookback (seconds) for the underlying momentum signal (priceFeed.getReturn). */
+  momentumLookbackSec: number;
+  /** |prior return| must exceed this to take a side. 0.0010 (0.10%): the 0.05-0.10%
+   *  bucket was NOISE (53% win, −EV) on both tape days; ≥0.10% won 68-77%. */
+  momentumThreshold: number;
+  /** |prior return| at/above which we size up (win% rises with move size). */
+  momentumStrongThreshold: number;
+  /** Clip multiplier when |prior return| >= momentumStrongThreshold (conviction). */
+  momentumStrongMult: number;
+  /** Long-only: bet YES on uptrends, SKIP downtrends (never buy NO). */
+  momentumLongOnly: boolean;
+  /** Never pay an ask above this (past here the book already priced the move). */
+  momentumMaxAsk: number;
+  /** Taker clip size (shares) for the momentum entry. */
+  momentumClipShares: number;
   /** Simulator only: fraction of a crossing trade's size we assume to capture
    *  (queue-position proxy). 1.0 = front-of-line on the whole print. */
   fillParticipation: number;
@@ -261,6 +289,16 @@ export function parseBotYaml(raw: string): BotConfig {
     harvestMinMid: m.harvest_min_mid ?? 0.60,
     harvestMaxAsk: m.harvest_max_ask ?? 0.90,
     harvestClipShares: m.harvest_clip_shares ?? 5,
+    momentumTrend: m.momentum_trend ?? false,
+    momentumEnterSec: m.momentum_enter_sec ?? 270,
+    momentumExitSec: m.momentum_exit_sec ?? 120,
+    momentumLookbackSec: m.momentum_lookback_sec ?? 300,
+    momentumThreshold: m.momentum_threshold ?? 0.0010,
+    momentumStrongThreshold: m.momentum_strong_threshold ?? 0.0020,
+    momentumStrongMult: m.momentum_strong_mult ?? 2,
+    momentumLongOnly: m.momentum_long_only ?? false,
+    momentumMaxAsk: m.momentum_max_ask ?? 0.80,
+    momentumClipShares: m.momentum_clip_shares ?? 5,
     fillParticipation: m.fill_participation ?? 1.0,
     // Accept new key `taker_fee_rate` (0.07) or fall back to the legacy
     // `taker_fee_max` if an old bot.yml is still in use.

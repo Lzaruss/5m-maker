@@ -45,6 +45,7 @@ import { PriceFeed } from './signals/priceFeed.js';
 import { ClobMarketFeed, type BookSnapshot } from './marketFeed/clobMarketFeed.js';
 import { computeQuotes } from './engine/quoter.js';
 import { decideHarvest } from './engine/harvester.js';
+import { decideMomentum } from './engine/momentum.js';
 import { checkGates } from './live/riskGate.js';
 import { reconcile, type DesiredQuote, type LiveOrder } from './live/reconciler.js';
 import {
@@ -258,8 +259,10 @@ async function main(): Promise<void> {
   }
 
   // Warm up the Binance price feed for ALL configured assets BEFORE quoting.
-  // `getReturn(asset, 30)` needs ~24s of buffered ticks per asset.
-  const priceFeed = new PriceFeed();
+  // `getReturn(asset, 30)` needs ~24s of buffered ticks per asset. The momentum
+  // strategy reads getReturn(asset, momentumLookbackSec) (~300s), so size the
+  // rolling buffer to cover that lookback plus headroom.
+  const priceFeed = new PriceFeed(Math.max(70_000, (cfg.maker.momentumLookbackSec + 60) * 1000));
   priceFeed.start(cfg.live.assets);
   const ready = await priceFeed.waitUntilReady(cfg.live.assets, 40_000);
   if (!ready) {
@@ -434,7 +437,7 @@ async function main(): Promise<void> {
     // window-close can compute the settle-based (shadow) P&L.
     let harvested = false;
     let harvestIntent:
-      | { tokenId: string; leg: 'YES' | 'NO'; ask: number; shares: number; mid: number; ttrSec: number; ts: number }
+      | { tokenId: string; leg: 'YES' | 'NO'; ask: number; shares: number; mid: number; ttrSec: number; ts: number; mode: 'favorite' | 'momentum'; priorReturn?: number }
       | null = null;
 
     logEvent({
@@ -803,6 +806,66 @@ async function main(): Promise<void> {
         break;
       }
 
+      // 3a. MOMENTUM-TREND (2026-05-31). Just after the window opens, read the
+      //     underlying's prior-Ns return and bet WITH the trend (up→YES, down→NO),
+      //     taker, hold to resolution. 5-min windows autocorrelate and the fresh
+      //     book hasn't priced the continuation yet → early entry is +EV. Bypasses
+      //     the maker phases like the harvester; shares its intent + shadow plumbing.
+      if (cfg.maker.momentumTrend) {
+        if (!harvested && !halted && !isThrottled() && !state.paused) {
+          const yesBook = books.get(legs.find((l) => l.label === 'YES')!.tokenId);
+          const noBook = books.get(legs.find((l) => l.label === 'NO')!.tokenId);
+          const decision = decideMomentum({
+            ttrSec: timeToResolveSec,
+            enterSec: cfg.maker.momentumEnterSec,
+            exitSec: cfg.maker.momentumExitSec,
+            priorReturn: priceFeed.getReturn(ASSET, cfg.maker.momentumLookbackSec),
+            threshold: cfg.maker.momentumThreshold,
+            strongThreshold: cfg.maker.momentumStrongThreshold,
+            strongMult: cfg.maker.momentumStrongMult,
+            longOnly: cfg.maker.momentumLongOnly,
+            maxAsk: cfg.maker.momentumMaxAsk,
+            clipShares: cfg.maker.momentumClipShares,
+            minClipShares: cfg.maker.minQuoteShares,
+            yes: { bestBid: yesBook?.bids[0]?.price ?? null, bestAsk: yesBook?.asks[0]?.price ?? null, askSize: yesBook?.asks[0]?.size ?? null },
+            no: { bestBid: noBook?.bids[0]?.price ?? null, bestAsk: noBook?.asks[0]?.price ?? null, askSize: noBook?.asks[0]?.size ?? null },
+          });
+          if (decision.action === 'enter' && decision.side && decision.ask != null && decision.shares != null) {
+            const sideLeg = legs.find((l) => l.label === decision.side)!;
+            const sideBook = decision.side === 'YES' ? yesBook : noBook;
+            const sideMid = sideBook && sideBook.bids[0] && sideBook.asks[0] ? (sideBook.bids[0].price + sideBook.asks[0].price) / 2 : decision.ask;
+            harvested = true;
+            harvestIntent = {
+              tokenId: sideLeg.tokenId,
+              leg: decision.side,
+              ask: decision.ask,
+              shares: decision.shares,
+              mid: sideMid,
+              ttrSec: timeToResolveSec,
+              ts: Date.now(),
+              mode: 'momentum',
+              priorReturn: decision.priorReturn,
+            };
+            logEvent({
+              kind: 'momentum_entry',
+              token: sideLeg.tokenId,
+              leg: decision.side,
+              ask: decision.ask,
+              shares: decision.shares,
+              priorReturn: decision.priorReturn,
+              ttrSec: Math.round(timeToResolveSec),
+              dryRun: !enabled,
+            });
+            logger.info(
+              { side: decision.side, ask: decision.ask, shares: decision.shares, priorReturnPct: decision.priorReturn != null ? Number((decision.priorReturn * 100).toFixed(3)) : null, ttr: Math.round(timeToResolveSec) },
+              'MOMENTUM-TREND — taker buy with the trend (hold to resolution)',
+            );
+            if (enabled) await marketFlatten(sideLeg.tokenId, 'BUY', decision.shares, decision.ask);
+          }
+        }
+        continue; // momentum holds to resolution — skip the maker flatten + quote phases
+      }
+
       // 3b. FAVORITE HARVESTER (2026-05-30 strategy redesign). When enabled this
       //     REPLACES the matched-pair maker entirely: late in the window, cross
       //     the spread to BUY the book's favorite (one clip) and HOLD to
@@ -840,6 +903,7 @@ async function main(): Promise<void> {
               mid: decision.mid ?? 0,
               ttrSec: timeToResolveSec,
               ts: Date.now(),
+              mode: 'favorite',
             };
             logEvent({
               kind: 'harvest_entry',
@@ -1446,11 +1510,13 @@ async function main(): Promise<void> {
       }
       logEvent({
         kind: 'harvest_result',
+        mode: hi.mode,
         token: hi.tokenId,
         leg: hi.leg,
         ask: hi.ask,
         shares: hi.shares,
         mid: hi.mid,
+        priorReturn: hi.priorReturn ?? null,
         entryTtrSec: Math.round(hi.ttrSec),
         yesWon: res ? res.yesWon : null,
         wonSide,

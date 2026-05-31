@@ -25,9 +25,9 @@
  */
 import { readFileSync, readdirSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { loadBotYaml, type MakerConfig } from '../src/util/config.js';
-import { computeQuotes } from '../src/engine/quoter.js';
-import { emptyInventory, applyFill, type InventoryState } from '../src/engine/inventory.js';
+import { loadBotYaml, type MakerConfig } from '../../src/util/config.js';
+import { computeQuotes } from '../../src/engine/quoter.js';
+import { emptyInventory, applyFill, type InventoryState } from '../../src/engine/inventory.js';
 
 interface Ev {
   t: 'book' | 'trade';
