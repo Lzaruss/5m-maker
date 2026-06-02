@@ -125,7 +125,6 @@ export class Notifier {
 
   async windowResult(
     windowPnl: number,
-    realizedTodayUsd: number,
     yesWon: boolean | null,
     /** On-chain wallet change over the window (netWorth at close − netWorth at open).
      *  Null when the balance snapshot was unavailable. Used to cross-check the
@@ -133,6 +132,8 @@ export class Notifier {
      *  wrong winner briefly) is surfaced immediately rather than buried in the
      *  next periodic reality-check. */
     walletDeltaUsd?: number | null,
+    /** Liquid USDC cash at window close — shown as the account balance. */
+    cashUsd?: number | null,
   ): Promise<void> {
     // UNRESOLVED windows: windowPnl is only a 0.5-fallback estimate AND is NOT
     // booked into `today` (deferred). Showing a confident "+$12.75" next to
@@ -141,9 +142,8 @@ export class Notifier {
     // NOT print a dollar PnL for unresolved windows; the real outcome lands in
     // net worth via auto-redeem and the periodic reality check.
     if (yesWon === null) {
-      await this.send(
-        `⏳ Window pending resolution — not booked yet | today: $${realizedTodayUsd.toFixed(2)} (mark)`,
-      );
+      const balancePart = cashUsd != null ? ` | balance: $${cashUsd.toFixed(2)}` : '';
+      await this.send(`⏳ Window pending resolution — not booked yet${balancePart}`);
       return;
     }
     // RESOLVED: settle is the true 0/1 outcome, so windowPnl is real PnL (given
@@ -171,9 +171,14 @@ export class Notifier {
     // wrong mark never shows a green when the wallet is in the red.
     const realPnl = walletDeltaUsd ?? windowPnl;
     const emoji = realPnl >= 0 ? '🟢' : '🔴';
+    const balancePart = cashUsd != null ? ` | balance: $${cashUsd.toFixed(2)}` : '';
     await this.send(
-      `${emoji} Window ${pnlSign(windowPnl)}$${windowPnl.toFixed(2)} (mark)${walletLine}${mismatchWarning} | today: $${realizedTodayUsd.toFixed(2)} (mark) | ${outcome}`,
+      `${emoji} Window ${pnlSign(windowPnl)}$${windowPnl.toFixed(2)} (mark)${walletLine}${mismatchWarning}${balancePart} | ${outcome}`,
     );
+  }
+
+  async hourlyBalance(cashUsd: number): Promise<void> {
+    await this.send(`💰 Balance: $${cashUsd.toFixed(2)}`);
   }
 
   /**

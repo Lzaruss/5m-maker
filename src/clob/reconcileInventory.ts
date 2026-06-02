@@ -8,6 +8,24 @@ export interface OnchainLeg {
   avgPrice: number;
 }
 
+// ── Circuit breaker ────────────────────────────────────────────────────────
+// After repeated failures we stop hammering the data-api and back off
+// exponentially. Resets automatically on the first successful call.
+let _consecFailures = 0;
+let _backoffUntilMs = 0;
+
+function _backoffMs(failures: number): number {
+  // 0-2 failures  → no backoff (retry every cycle)
+  // 3-9 failures  → 60 s
+  // 10-19 failures → 5 min
+  // 20+ failures  → 30 min
+  if (failures < 3)  return 0;
+  if (failures < 10) return 60_000;
+  if (failures < 20) return 5 * 60_000;
+  return 30 * 60_000;
+}
+// ──────────────────────────────────────────────────────────────────────────
+
 /**
  * Read the wallet's TRUE on-chain share holdings for the given tokens. This is
  * the ground truth that the fill-poller (`fetchOurTrades` over /activity, ~15-20s
@@ -20,11 +38,27 @@ export interface OnchainLeg {
  * this cycle rather than treating everything as flat.
  */
 export async function fetchOnchainShares(tokenIds: string[]): Promise<Map<string, OnchainLeg> | null> {
+  // Circuit breaker: skip the HTTP call entirely while in backoff window.
+  if (_backoffUntilMs > 0 && Date.now() < _backoffUntilMs) return null;
+
   let positions;
   try {
     positions = await getOpenPositions();
+    // Success — reset circuit breaker.
+    if (_consecFailures > 0) {
+      logger.info({ prevFailures: _consecFailures }, 'fetchOnchainShares recovered — reconciliation resumed');
+      _consecFailures = 0;
+      _backoffUntilMs = 0;
+    }
   } catch (err: any) {
-    logger.warn({ err: err.message }, 'fetchOnchainShares failed — skipping reconciliation this cycle');
+    _consecFailures++;
+    const nextBackoff = _backoffMs(_consecFailures);
+    _backoffUntilMs = nextBackoff > 0 ? Date.now() + nextBackoff : 0;
+    const logFn = _consecFailures <= 3 ? logger.warn.bind(logger) : logger.debug.bind(logger);
+    logFn(
+      { err: err.message, consecFailures: _consecFailures, backoffSec: Math.round(nextBackoff / 1000) },
+      'fetchOnchainShares failed — skipping reconciliation this cycle',
+    );
     return null;
   }
   const wanted = new Set(tokenIds);

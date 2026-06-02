@@ -102,7 +102,9 @@ async function main(): Promise<void> {
   }
 
   // Then: trade the gate. When trend-up bet YES@ask; when trend-dn bet NO@ask. Hold to resolution.
-  console.log(`\n  -- trade the trend gate (hold to resolution, net fee) --`);
+  // --contrarian flips the side (fade the trend) to test the mean-reversion hypothesis.
+  const CONTRARIAN = process.argv.includes('--contrarian');
+  console.log(`\n  -- trade the ${CONTRARIAN ? 'CONTRARIAN (fade)' : 'trend'} gate (hold to resolution, net fee) --`);
   for (const L of [120, 300, 600]) {
     for (const thr of [0.0005, 0.0015, 0.003]) {
       let n = 0, win = 0, pnl = 0, inv = 0;
@@ -115,6 +117,7 @@ async function main(): Promise<void> {
         let side: 'YES' | 'NO' | null = null;
         if (r >= thr) side = 'YES'; else if (r <= -thr) side = 'NO';
         if (!side) continue;
+        if (CONTRARIAN) side = side === 'YES' ? 'NO' : 'YES';
         const en = nearest(side === 'YES' ? w.yes : w.no, entrySec); if (!en || en.ask == null) continue;
         const entry = en.ask; if (entry <= 0.02 || entry >= 0.98) continue;
         const won = side === 'YES' ? w.yesWon : !w.yesWon;

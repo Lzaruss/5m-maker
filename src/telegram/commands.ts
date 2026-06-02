@@ -25,6 +25,9 @@ export interface CommandsDeps {
   /** Called by /stop. The orchestrator does cancel + flatten + closeLog +
    *  exit; here we just request it. */
   requestShutdown: (reason: string) => void;
+  /** Called by /resume. Resets all internal counters and halt flags as if
+   *  the bot was freshly launched (keeps the process alive). */
+  requestReset: () => void;
 }
 
 function fmtUsd(n: number): string {
@@ -256,20 +259,9 @@ export function registerCommands(d: CommandsDeps): void {
 
   d.bot.onText(/^\/resume/, (msg) =>
     guard(msg, async () => {
-      if (d.state.haltedSession) {
-        await reply('🛑 Session halt is active — the process is exiting. Please restart with `npm start`.');
-        return;
-      }
-      d.state.paused = false;
-      if (d.state.haltedDaily) {
-        d.state.haltedDaily = false;
-        d.state.haltUntilMs = 0;
-        logEvent({ kind: 'telegram_resume', wasDaily: true });
-        await reply('▶️ Manual resume — daily halt cleared, quoting active.');
-      } else {
-        logEvent({ kind: 'telegram_resume', wasDaily: false });
-        await reply('▶️ Resumed.');
-      }
+      d.requestReset();
+      logEvent({ kind: 'telegram_resume', fullReset: true });
+      await reply('🔄 *Reset completo* — contadores y pausas reiniciados. El bot sigue activo como si acabara de arrancar.');
     }),
   );
 

@@ -8,6 +8,7 @@ const base: Omit<MomentumInput, 'ttrSec' | 'priorReturn'> = {
   strongThreshold: 0.0020,
   strongMult: 2,
   longOnly: false,
+  contrarian: false,
   maxAsk: 0.80,
   clipShares: 5,
   minClipShares: 5,
@@ -67,6 +68,30 @@ describe('decideMomentum — direction', () => {
     const d = decideMomentum({ ...base, ttrSec: 260, priorReturn: -0.0015, longOnly: true });
     expect(d.action).toBe('wait');
     expect(d.reason).toBe('long_only_skip_down');
+  });
+});
+
+describe('decideMomentum — contrarian (fade the trend)', () => {
+  it('fades an uptrend → buys NO', () => {
+    const d = decideMomentum({ ...base, ttrSec: 260, priorReturn: 0.0015, contrarian: true });
+    expect(d.action).toBe('enter');
+    expect(d.side).toBe('NO');
+    expect(d.reason).toBe('fade');
+  });
+
+  it('fades a downtrend → buys YES', () => {
+    const d = decideMomentum({ ...base, ttrSec: 260, priorReturn: -0.0015, contrarian: true });
+    expect(d.action).toBe('enter');
+    expect(d.side).toBe('YES');
+    expect(d.reason).toBe('fade');
+  });
+
+  it('contrarian still sizes up on strong moves', () => {
+    const d = decideMomentum({ ...base, ttrSec: 260, priorReturn: 0.0030, contrarian: true });
+    expect(d.action).toBe('enter');
+    expect(d.side).toBe('NO');
+    expect(d.shares).toBe(10);
+    expect(d.reason).toBe('fade_strong');
   });
 });
 

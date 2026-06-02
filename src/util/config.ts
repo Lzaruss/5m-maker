@@ -4,6 +4,15 @@ import yaml from 'js-yaml';
 import 'dotenv/config';
 import { ALL_ASSETS, isAsset, type Asset } from './assets.js';
 
+/** One averaging-down level for the martingale entry strategy. */
+export interface MartingaleLevel {
+  /** Absolute price drop below the initial entry ask that triggers this level.
+   *  e.g. 0.08 means: buy when currentAsk <= entryPrice - 0.08 */
+  priceDrop: number;
+  /** USDC to spend at this level. Shares = addUsdc / currentAsk. */
+  addUsdc: number;
+}
+
 export interface AdverseGuardConfig {
   /** |btcReturn30s| at/above which we widen the spread. */
   btcReturn30sWiden: number;
@@ -151,10 +160,47 @@ export interface MakerConfig {
   momentumStrongMult: number;
   /** Long-only: bet YES on uptrends, SKIP downtrends (never buy NO). */
   momentumLongOnly: boolean;
+  /** Contrarian: fade the trend (up→NO, down→YES) — a mean-reversion bet, the
+   *  inverse of the momentum edge. Experimental. */
+  momentumContrarian: boolean;
   /** Never pay an ask above this (past here the book already priced the move). */
   momentumMaxAsk: number;
+  /** Intra-window take-profit: if the bid of the entry token rises above this
+   *  after the momentum entry, sell immediately to crystallize the gain.
+   *  0 = disabled (always hold to resolution). */
+  momentumTakeProfitBid: number;
+  /** Skip momentum entries for the first N resolved windows of each session.
+   *  Lets the signal fill its lookback buffer and avoids cold-start losses.
+   *  0 = disabled (enter from window 0). */
+  momentumWarmupWindows: number;
   /** Taker clip size (shares) for the momentum entry. */
   momentumClipShares: number;
+  // ── Martingale averaging-down (2026-06-01, @savvvv pattern) ──────────────
+  /** Enable averaging-down on top of the momentum-trend entry. When true, after
+   *  the initial momentum buy the bot watches the ask each tick; if it drops
+   *  below the entry price by `martingaleLevels[i].priceDrop`, it buys another
+   *  `martingaleLevels[i].addUsdc` USDC worth of the same side. Each level fires
+   *  at most once per window. Total spend capped at `martingaleMaxSpendUsd`.
+   *  Requires `momentumTrend: true`. Tail risk: the occasional window that goes
+   *  to zero loses the full deployed amount — set `martingaleMaxSpendUsd` and
+   *  the orchestrator's `cash_floor_usd` / `net_worth_halt_usd` accordingly. */
+  martingaleEnabled: boolean;
+  /** Initial entry size in USDC (overrides momentum_clip_shares when enabled).
+   *  Shares = martingaleInitialUsdc / currentAsk at entry time. */
+  martingaleInitialUsdc: number;
+  /** Averaging levels. Each fires once per window when ask drops by `priceDrop`
+   *  below the initial entry ask. Levels are scanned in order (first unfired level
+   *  that qualifies fires); priceDrop should be ascending. */
+  martingaleLevels: MartingaleLevel[];
+  /** Hard cap on TOTAL USDC deployed per token per window (initial + all levels).
+   *  Protects against runaway averaging. Must be >= martingaleInitialUsdc. */
+  martingaleMaxSpendUsd: number;
+  /** Do not fire any averaging level when timeToResolve < this (seconds).
+   *  A sustained drop this close to resolution is real price discovery, not noise. */
+  martingaleMinTtrSec: number;
+  /** Never average below this ask price. Below this the market is pricing a
+   *  near-certain loss; adding capital is throwing good money after bad. */
+  martingaleMinAsk: number;
   /** Simulator only: fraction of a crossing trade's size we assume to capture
    *  (queue-position proxy). 1.0 = front-of-line on the whole print. */
   fillParticipation: number;
@@ -297,8 +343,27 @@ export function parseBotYaml(raw: string): BotConfig {
     momentumStrongThreshold: m.momentum_strong_threshold ?? 0.0020,
     momentumStrongMult: m.momentum_strong_mult ?? 2,
     momentumLongOnly: m.momentum_long_only ?? false,
+    momentumContrarian: m.momentum_contrarian ?? false,
     momentumMaxAsk: m.momentum_max_ask ?? 0.80,
+    momentumTakeProfitBid: m.momentum_take_profit_bid ?? 0,
+    momentumWarmupWindows: m.momentum_warmup_windows ?? 0,
     momentumClipShares: m.momentum_clip_shares ?? 5,
+    // ── Martingale averaging-down ──────────────────────────────────────────
+    martingaleEnabled: m.martingale_enabled === true,
+    martingaleInitialUsdc: m.martingale_initial_usdc ?? 20,
+    martingaleLevels: (() => {
+      if (!Array.isArray(m.martingale_levels)) return [];
+      return (m.martingale_levels as any[]).flatMap((lvl: any): MartingaleLevel[] => {
+        const drop = Number(lvl?.price_drop);
+        const usdc = Number(lvl?.add_usdc);
+        if (!Number.isFinite(drop) || drop <= 0) return [];
+        if (!Number.isFinite(usdc) || usdc <= 0) return [];
+        return [{ priceDrop: drop, addUsdc: usdc }];
+      });
+    })(),
+    martingaleMaxSpendUsd: m.martingale_max_spend_usd ?? 100,
+    martingaleMinTtrSec: m.martingale_min_ttr_sec ?? 60,
+    martingaleMinAsk: m.martingale_min_ask ?? 0.23,
     fillParticipation: m.fill_participation ?? 1.0,
     // Accept new key `taker_fee_rate` (0.07) or fall back to the legacy
     // `taker_fee_max` if an old bot.yml is still in use.

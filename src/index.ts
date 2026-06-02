@@ -46,6 +46,7 @@ import { ClobMarketFeed, type BookSnapshot } from './marketFeed/clobMarketFeed.j
 import { computeQuotes } from './engine/quoter.js';
 import { decideHarvest } from './engine/harvester.js';
 import { decideMomentum } from './engine/momentum.js';
+import { decideMartingale } from './engine/martingale.js';
 import { checkGates } from './live/riskGate.js';
 import { reconcile, type DesiredQuote, type LiveOrder } from './live/reconciler.js';
 import {
@@ -253,6 +254,37 @@ async function main(): Promise<void> {
         cashFloorUsd: cfg.live.cashFloorUsd,
       },
       requestShutdown: (reason) => void shutdown(reason, enabled, 0),
+      requestReset: () => {
+        // Reset all halt flags and counters as if the bot just launched.
+        halted = false;
+        haltUntilMs = 0;
+        consecLosses = 0;
+        realizedTodayUsd = 0;
+        realizedSessionUsd = 0;
+        windowsCount = 0;
+        winningWindows = 0;
+        losingWindows = 0;
+        placeOkCount = 0;
+        placeFailCount = 0;
+        netWorthHaltTriggered = false;
+        cashFloorWarned = false;
+        lastHourlyBalanceMs = 0;
+        // Mirror into shared state so /status reflects the reset immediately.
+        state.paused = false;
+        state.haltedDaily = false;
+        state.haltUntilMs = 0;
+        state.haltedSession = false;
+        state.realizedTodayUsd = 0;
+        state.realizedSessionUsd = 0;
+        state.windowsCount = 0;
+        state.winningWindows = 0;
+        state.losingWindows = 0;
+        state.placeOkCount = 0;
+        state.placeFailCount = 0;
+        state.startedAtMs = Date.now();
+        logEvent({ kind: 'telegram_reset' });
+        logger.info('bot reset via /resume — counters and halts cleared');
+      },
     });
     logger.info('telegram bot online');
     void notifier.start(balance, cfg.live.sessionLossHaltUsd, cfg.live.dailyLossHaltUsd);
@@ -324,12 +356,14 @@ async function main(): Promise<void> {
   let losingWindows = 0;
   let consecLosses = 0; // consecutive losing windows (reset to 0 on any win or break-even)
   const SUMMARY_INTERVAL_MS = 5 * 60_000;
-  // Net-worth reality check runs faster than the summary so the on-chain
-  // drawdown halt reacts quickly; the Telegram PUSH is still throttled to the
-  // summary interval to avoid spam.
-  const NET_WORTH_CHECK_MS = 90_000;
+  // Net-worth reality check — the PRIMARY real-money drawdown guard (the tracker-
+  // based halts are blind to deferred/unconfirmed-resolution losses, 2026-06-01).
+  // Runs every 30s so the wallet-based net_worth_halt reacts promptly and overshoots
+  // by at most ~one entry; the Telegram PUSH stays throttled to the summary interval.
+  const NET_WORTH_CHECK_MS = 30_000;
+  const HOURLY_BALANCE_MS = 60 * 60_000;
   let lastNetWorthMs = 0;
-  let lastNetWorthPushMs = 0;
+  let lastHourlyBalanceMs = 0;
   let netWorthHaltTriggered = false;
 
   // Unified session-stop event. Every halt path also writes one of these with a
@@ -369,6 +403,10 @@ async function main(): Promise<void> {
     // the other asset's live subscription.
     const books: Map<string, BookSnapshot> = new Map();
     const lastMids: Map<string, number> = new Map();
+    // Set by each inner-loop iteration so the WebSocket onBook callback can
+    // resolve the Promise.race and wake the loop immediately on a book change,
+    // instead of waiting for the full pollIntervalMs sleep.
+    let signalBookUpdate: (() => void) | null = null;
     const marketFeed = new ClobMarketFeed({
       onBook: (snap) => {
         books.set(snap.assetId, snap);
@@ -376,6 +414,7 @@ async function main(): Promise<void> {
           const mid = (snap.bids[0].price + snap.asks[0].price) / 2;
           if (mid > 0) lastMids.set(snap.assetId, mid);
         }
+        if (signalBookUpdate) { signalBookUpdate(); signalBookUpdate = null; }
       },
     });
     // Last on-chain reconciliation timestamp (0 => fire on the first eligible tick).
@@ -436,9 +475,25 @@ async function main(): Promise<void> {
     // then hold to resolution. `harvestIntent` records what we bought so the
     // window-close can compute the settle-based (shadow) P&L.
     let harvested = false;
+    // Set to true once the intra-window take-profit sell has fired. Prevents
+    // re-entry and stops further martingale levels from adding to a sold position.
+    let momentumExited = false;
     let harvestIntent:
       | { tokenId: string; leg: 'YES' | 'NO'; ask: number; shares: number; mid: number; ttrSec: number; ts: number; mode: 'favorite' | 'momentum'; priorReturn?: number }
       | null = null;
+
+    // Martingale per-window state: tracks which averaging levels have fired and
+    // total USDC deployed (initial + levels) so the spend cap is enforced.
+    const martingaleState = {
+      levelsExecuted: cfg.maker.martingaleLevels.map(() => false),
+      spentUsd: 0,
+    };
+
+    // Price-snap logging: throttle to one log every 30s while a position is open.
+    // Captures bid/ask/spread trajectory for post-session research (stop-loss
+    // calibration, ask velocity, TP timing). No operational effect — read-only.
+    let lastPriceSnapMs = 0;
+    const PRICE_SNAP_INTERVAL_MS = 30_000;
 
     logEvent({
       kind: 'window_open',
@@ -490,10 +545,21 @@ async function main(): Promise<void> {
     }
     marketFeed.setAssets(legs.map((l) => l.tokenId));
 
+    // Throttle the REST fill poll independently of the main tick rate.
+    // At 300 ms ticks the /activity endpoint would get 200+ calls/min —
+    // 2 s is enough to track fills without hitting rate limits.
+    let lastFillPollMs = 0;
+
     // ------------------------------------------------------------ inner loop
     while (Date.now() <= resolvesAtMs + 60_000) {
       if (shuttingDown) return;
-      await sleep(cfg.live.pollIntervalMs);
+      // Wake up as soon as the book changes (via signalBookUpdate set in onBook),
+      // or after pollIntervalMs at the latest. This makes entry and martingale
+      // checks react to price moves immediately rather than on a fixed cadence.
+      await Promise.race([
+        sleep(cfg.live.pollIntervalMs),
+        new Promise<void>((r) => { signalBookUpdate = r; }),
+      ]);
 
       // Mirror live counters into the shared state so /status etc. are O(1).
       state.realizedTodayUsd = realizedTodayUsd;
@@ -576,18 +642,10 @@ async function main(): Promise<void> {
             markSessionUsd: realizedSessionUsd,
             markGapUsd: Number.isFinite(netDelta) ? realizedSessionUsd - netDelta : null,
           });
-          // Throttle the Telegram PUSH to the summary cadence (avoid 90s spam),
-          // but always evaluate the halt above on the faster timer.
-          if (Date.now() - lastNetWorthPushMs >= SUMMARY_INTERVAL_MS) {
-            lastNetWorthPushMs = Date.now();
-            void notifier.netWorthCheck({
-              netWorthUsd: av.netWorthUsd,
-              startBalanceUsd: state.startBalanceUsd,
-              cashUsd: av.cashUsd,
-              redeemableUsd: av.redeemableUsd,
-              redeemableCount: av.redeemableCount,
-              markSessionUsd: realizedSessionUsd,
-            });
+          // Hourly balance push to Telegram.
+          if (Date.now() - lastHourlyBalanceMs >= HOURLY_BALANCE_MS) {
+            lastHourlyBalanceMs = Date.now();
+            void notifier.hourlyBalance(av.cashUsd);
           }
           // HARD HALT on real net-worth drawdown. Reads the wallet, not the
           // internal counters — the backstop that would have caught the
@@ -620,11 +678,13 @@ async function main(): Promise<void> {
         }
       }
 
-      // 1. Pull fills for ALL legs in ONE HTTP round-trip. The data-api
-      //    /activity endpoint returns all user activity regardless of token, so
-      //    calling it once and splitting by tokenId is strictly equivalent to
-      //    calling it N times sequentially — but N× faster.
-      {
+      // 1. Pull fills for ALL legs in ONE HTTP round-trip (throttled to 2 s).
+      //    The loop now wakes on every book update, so without throttling the
+      //    /activity REST endpoint would get 5-20 calls/s during an active book.
+      //    2 s is fast enough to track fills; the on-chain reconcile (every 5 s)
+      //    is the backstop that catches anything this poll misses.
+      if (Date.now() - lastFillPollMs >= 2000) {
+        lastFillPollMs = Date.now();
         const sinceMs = Math.min(...legs.map((l) => l.sinceMs));
         const allTrades = await fetchAllOurTrades(legs.map((l) => l.tokenId), sinceMs);
         for (const leg of legs) {
@@ -812,7 +872,8 @@ async function main(): Promise<void> {
       //     book hasn't priced the continuation yet → early entry is +EV. Bypasses
       //     the maker phases like the harvester; shares its intent + shadow plumbing.
       if (cfg.maker.momentumTrend) {
-        if (!harvested && !halted && !isThrottled() && !state.paused) {
+        const inWarmup = cfg.maker.momentumWarmupWindows > 0 && windowsCount < cfg.maker.momentumWarmupWindows;
+        if (!harvested && !inWarmup && !halted && !isThrottled() && !state.paused) {
           const yesBook = books.get(legs.find((l) => l.label === 'YES')!.tokenId);
           const noBook = books.get(legs.find((l) => l.label === 'NO')!.tokenId);
           const decision = decideMomentum({
@@ -824,6 +885,7 @@ async function main(): Promise<void> {
             strongThreshold: cfg.maker.momentumStrongThreshold,
             strongMult: cfg.maker.momentumStrongMult,
             longOnly: cfg.maker.momentumLongOnly,
+            contrarian: cfg.maker.momentumContrarian,
             maxAsk: cfg.maker.momentumMaxAsk,
             clipShares: cfg.maker.momentumClipShares,
             minClipShares: cfg.maker.minQuoteShares,
@@ -834,12 +896,24 @@ async function main(): Promise<void> {
             const sideLeg = legs.find((l) => l.label === decision.side)!;
             const sideBook = decision.side === 'YES' ? yesBook : noBook;
             const sideMid = sideBook && sideBook.bids[0] && sideBook.asks[0] ? (sideBook.bids[0].price + sideBook.asks[0].price) / 2 : decision.ask;
+            // When martingale is enabled, use USDC-based sizing for the initial entry
+            // instead of the shares-based clip.  shares = martingaleInitialUsdc / ask,
+            // floored to the venue minimum.
+            let entryShares = decision.shares;
+            if (cfg.maker.martingaleEnabled && cfg.maker.martingaleInitialUsdc > 0) {
+              const rawShares = cfg.maker.martingaleInitialUsdc / decision.ask;
+              entryShares = Math.max(
+                cfg.maker.minQuoteShares,
+                Math.floor(rawShares * 100) / 100,
+              );
+              martingaleState.spentUsd = cfg.maker.martingaleInitialUsdc;
+            }
             harvested = true;
             harvestIntent = {
               tokenId: sideLeg.tokenId,
               leg: decision.side,
               ask: decision.ask,
-              shares: decision.shares,
+              shares: entryShares,
               mid: sideMid,
               ttrSec: timeToResolveSec,
               ts: Date.now(),
@@ -851,18 +925,141 @@ async function main(): Promise<void> {
               token: sideLeg.tokenId,
               leg: decision.side,
               ask: decision.ask,
-              shares: decision.shares,
+              shares: entryShares,
+              usdcNotional: Number((entryShares * decision.ask).toFixed(2)),
               priorReturn: decision.priorReturn,
+              reason: decision.reason,
+              contrarian: cfg.maker.momentumContrarian,
+              ttrSec: Math.round(timeToResolveSec),
+              martingale: cfg.maker.martingaleEnabled,
+              dryRun: !enabled,
+            });
+            logger.info(
+              { side: decision.side, ask: decision.ask, shares: entryShares, priorReturnPct: decision.priorReturn != null ? Number((decision.priorReturn * 100).toFixed(3)) : null, ttr: Math.round(timeToResolveSec) },
+              'MOMENTUM-TREND — taker buy with the trend (hold to resolution)',
+            );
+            if (enabled) await marketFlatten(sideLeg.tokenId, 'BUY', entryShares, decision.ask);
+          }
+        }
+
+        // ── MARTINGALE AVERAGING LEVELS ────────────────────────────────────────
+        // After initial entry: each tick check if the ask has dropped far enough
+        // below the entry price to trigger the next averaging level. Only one
+        // level fires per tick; subsequent levels fire on future ticks.
+        if (cfg.maker.martingaleEnabled && harvested && harvestIntent && !momentumExited && !halted && !isThrottled() && !state.paused) {
+          const sideLeg = legs.find((l) => l.label === harvestIntent!.leg)!;
+          const sideBook = books.get(sideLeg.tokenId);
+          const currentAsk = sideBook?.asks[0]?.price ?? null;
+          if (currentAsk != null) {
+            const avgDecision = decideMartingale({
+              entryPrice: harvestIntent.ask,
+              levelsExecuted: martingaleState.levelsExecuted,
+              levels: cfg.maker.martingaleLevels,
+              currentAsk,
+              maxAsk: cfg.maker.momentumMaxAsk,
+              minAsk: cfg.maker.martingaleMinAsk,
+              minShares: cfg.maker.minQuoteShares,
+              spentUsdThisWindow: martingaleState.spentUsd,
+              maxSpendUsd: cfg.maker.martingaleMaxSpendUsd,
+              ttrSec: timeToResolveSec,
+              minTtrSec: cfg.maker.martingaleMinTtrSec,
+            });
+            if (avgDecision.fire) {
+              const { levelIdx, shares, price, triggerDrop } = avgDecision;
+              martingaleState.levelsExecuted[levelIdx] = true;
+              martingaleState.spentUsd += cfg.maker.martingaleLevels[levelIdx].addUsdc;
+              // Also add to harvestIntent shares so the window-close shadow PnL
+              // calculation accounts for the full accumulated position.
+              harvestIntent = { ...harvestIntent, shares: harvestIntent.shares + shares };
+              logEvent({
+                kind: 'martingale_avg',
+                token: sideLeg.tokenId,
+                leg: harvestIntent.leg,
+                levelIdx,
+                entryPrice: harvestIntent.ask,
+                currentAsk: price,
+                triggerDrop: Number(triggerDrop.toFixed(4)),
+                shares,
+                addUsdc: cfg.maker.martingaleLevels[levelIdx].addUsdc,
+                totalSpentUsd: martingaleState.spentUsd,
+                dryRun: !enabled,
+              });
+              logger.info(
+                { leg: harvestIntent.leg, levelIdx, entryPrice: harvestIntent.ask, currentAsk: price, drop: Number(triggerDrop.toFixed(3)), shares, totalSpent: Number(martingaleState.spentUsd.toFixed(2)) },
+                'MARTINGALE — averaging down, adding shares',
+              );
+              if (enabled) await marketFlatten(sideLeg.tokenId, 'BUY', shares, price);
+            }
+          }
+        }
+
+        // ── INTRA-WINDOW TAKE-PROFIT ───────────────────────────────────────────
+        // If the entry token's bid has risen above the take-profit threshold,
+        // sell to crystallize the gain instead of riding to resolution.
+        // Only fires once (momentumExited gate); also blocks further martingale
+        // levels from adding to a position we've already decided to exit.
+        if (
+          cfg.maker.momentumTakeProfitBid > 0 &&
+          harvested && harvestIntent && !momentumExited &&
+          !halted && !isThrottled() && !state.paused
+        ) {
+          const tpLeg = legs.find((l) => l.tokenId === harvestIntent!.tokenId)!;
+          const tpBook = books.get(tpLeg.tokenId);
+          const tpBid = tpBook?.bids[0]?.price ?? 0;
+          // Use confirmed fill count; if fills haven't landed yet, wait for next tick.
+          const sharesHeld = tpLeg.account.shares;
+          if (tpBid >= cfg.maker.momentumTakeProfitBid && sharesHeld >= cfg.maker.minQuoteShares) {
+            momentumExited = true;
+            const gainPerShare = tpBid - harvestIntent.ask;
+            logEvent({
+              kind: 'momentum_take_profit',
+              token: tpLeg.tokenId,
+              leg: harvestIntent.leg,
+              entryAsk: harvestIntent.ask,
+              exitBid: tpBid,
+              shares: sharesHeld,
+              gainPerShare: Number(gainPerShare.toFixed(4)),
               ttrSec: Math.round(timeToResolveSec),
               dryRun: !enabled,
             });
             logger.info(
-              { side: decision.side, ask: decision.ask, shares: decision.shares, priorReturnPct: decision.priorReturn != null ? Number((decision.priorReturn * 100).toFixed(3)) : null, ttr: Math.round(timeToResolveSec) },
-              'MOMENTUM-TREND — taker buy with the trend (hold to resolution)',
+              { leg: harvestIntent.leg, entryAsk: harvestIntent.ask, exitBid: tpBid, shares: sharesHeld, gainPerShare: Number(gainPerShare.toFixed(3)), ttr: Math.round(timeToResolveSec) },
+              'TAKE-PROFIT — selling into strength to crystallize gain',
             );
-            if (enabled) await marketFlatten(sideLeg.tokenId, 'BUY', decision.shares, decision.ask);
+            if (enabled) await marketFlatten(tpLeg.tokenId, 'SELL', sharesHeld, tpBid);
           }
         }
+
+        // ── INTRA-WINDOW PRICE SNAP (research logging) ────────────────────────
+        // While a position is open, periodically snapshot bid/ask/spread so
+        // post-session scripts can research stop-loss thresholds, ask velocity,
+        // and TP timing without needing live data. Throttled to once per 30s.
+        if (harvested && harvestIntent && !momentumExited) {
+          const now = Date.now();
+          if (now - lastPriceSnapMs >= PRICE_SNAP_INTERVAL_MS) {
+            lastPriceSnapMs = now;
+            const snapLeg = legs.find((l) => l.tokenId === harvestIntent!.tokenId);
+            const snapBook = snapLeg ? books.get(snapLeg.tokenId) : undefined;
+            const snapBid = snapBook?.bids[0]?.price ?? null;
+            const snapAsk = snapBook?.asks[0]?.price ?? null;
+            if (snapBid != null && snapAsk != null) {
+              logEvent({
+                kind: 'price_snap',
+                token: harvestIntent.tokenId,
+                leg: harvestIntent.leg,
+                entryAsk: harvestIntent.ask,
+                bid: snapBid,
+                ask: snapAsk,
+                spread: Number((snapAsk - snapBid).toFixed(4)),
+                bidVsEntry: Number((snapBid - harvestIntent.ask).toFixed(4)),
+                ttrSec: Math.round(timeToResolveSec),
+                spentUsd: Number(martingaleState.spentUsd.toFixed(2)),
+                dryRun: !enabled,
+              });
+            }
+          }
+        }
+
         continue; // momentum holds to resolution — skip the maker flatten + quote phases
       }
 
@@ -1494,11 +1691,12 @@ async function main(): Promise<void> {
       });
     }
 
-    // FAVORITE HARVESTER shadow result. Score the harvest entry on the actual
-    // settle: hypoPnl = (won ? 1 : 0 - ask - takerFee) * shares. In dry-run this
-    // is the ONLY P&L track (no real fills moved the account); in live it cross-
-    // checks the real number. Only counted when the window resolved decisively.
-    if (cfg.maker.favoriteHarvester && harvestIntent) {
+    // SHADOW RESULT for the active taker strategy (harvester OR momentum). Score
+    // the entry on the actual settle: hypoPnl = (won ? 1 : 0 - ask - takerFee) *
+    // shares. In dry-run this is the ONLY P&L track; in live it cross-checks the
+    // real number. Gated on `harvestIntent` (set by EITHER strategy) — the earlier
+    // `&& favoriteHarvester` bug meant momentum entries logged no result (2026-05-31).
+    if (harvestIntent) {
       const hi = harvestIntent;
       const wonSide = res ? (hi.leg === 'YES' ? res.yesWon : !res.yesWon) : null;
       const fee = cfg.maker.takerFeeRate * hi.ask * (1 - hi.ask);
@@ -1538,8 +1736,10 @@ async function main(): Promise<void> {
     // transiently) or an accounting double-count shows up here as a gap between
     // the mark-based windowPnl and the real walletWindowDelta.
     let walletWindowDelta: number | null = null;
+    let closingCashUsd: number | null = null;
     try {
       const snapClose = await getAccountValue();
+      closingCashUsd = snapClose.cashUsd;
       logEvent({
         kind: 'wallet_snap',
         phase: 'window_close',
@@ -1586,7 +1786,7 @@ async function main(): Promise<void> {
     };
     // Push notable windows to Telegram (skip the noise of zero-PnL windows).
     if (Math.abs(windowPnl) >= 0.01) {
-      void notifier.windowResult(windowPnl, realizedTodayUsd, res ? res.yesWon : null, walletWindowDelta);
+      void notifier.windowResult(windowPnl, res ? res.yesWon : null, walletWindowDelta, closingCashUsd);
     }
 
     marketFeed.setAssets([]);

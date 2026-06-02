@@ -38,8 +38,17 @@ const cfg: MakerConfig = {
   momentumStrongThreshold: 0.002,
   momentumStrongMult: 2,
   momentumLongOnly: false,
+  momentumContrarian: false,
   momentumMaxAsk: 0.8,
   momentumClipShares: 5,
+  martingaleEnabled: false,
+  martingaleInitialUsdc: 20,
+  martingaleLevels: [],
+  martingaleMaxSpendUsd: 100,
+  martingaleMinTtrSec: 60,
+  martingaleMinAsk: 0.23,
+  momentumTakeProfitBid: 0,
+  momentumWarmupWindows: 0,
   // Tier-2 gates DISABLED in the base fixture so the original tests are
   // unaffected; each gate test below enables exactly what it exercises.
   noTradeBand50: 0,

@@ -41,6 +41,10 @@ export interface MomentumInput {
    *  "YES when trending up, sit out when down" — NOT "YES on every window" (which
    *  loses, since only ~49% of windows finish UP). */
   longOnly: boolean;
+  /** Contrarian: bet AGAINST the trend (fade it) instead of with it — up→NO,
+   *  down→YES. A bet that the regime is mean-reverting, not trending. Inverse of
+   *  the validated momentum edge (so −EV on the trending tape); a live experiment. */
+  contrarian: boolean;
   /** Never pay an ask above this. */
   maxAsk: number;
   clipShares: number;
@@ -82,7 +86,9 @@ export function decideMomentum(i: MomentumInput): MomentumDecision {
   if (i.priorReturn == null) return { action: 'wait', reason: 'no_signal' };
   if (Math.abs(i.priorReturn) < i.threshold) return { action: 'wait', reason: 'flat_trend' };
 
-  const side: 'YES' | 'NO' = i.priorReturn > 0 ? 'YES' : 'NO';
+  // Base side follows the trend; contrarian fades it (bets on mean-reversion).
+  const trendSide: 'YES' | 'NO' = i.priorReturn > 0 ? 'YES' : 'NO';
+  const side: 'YES' | 'NO' = i.contrarian ? (trendSide === 'YES' ? 'NO' : 'YES') : trendSide;
   if (i.longOnly && side === 'NO') return { action: 'wait', reason: 'long_only_skip_down' };
   const leg = side === 'YES' ? i.yes : i.no;
   // Conviction sizing: size up on strong moves (higher win rate there).
@@ -90,5 +96,6 @@ export function decideMomentum(i: MomentumInput): MomentumDecision {
   const targetClip = i.clipShares * (strong ? i.strongMult : 1);
   const b = buyable(leg, i.maxAsk, targetClip, i.minClipShares);
   if (!b) return { action: 'wait', reason: 'side_unbuyable' };
-  return { action: 'enter', side, ask: b.ask, shares: b.shares, priorReturn: i.priorReturn, reason: strong ? 'trend_strong' : 'trend' };
+  const base = i.contrarian ? 'fade' : 'trend';
+  return { action: 'enter', side, ask: b.ask, shares: b.shares, priorReturn: i.priorReturn, reason: strong ? `${base}_strong` : base };
 }

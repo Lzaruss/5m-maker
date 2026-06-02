@@ -25,7 +25,8 @@ maker:
   # signal is the prior-window move; the fresh book hasn't priced it yet.
   momentum_enter_sec: 270
   # Floor — stop entering once the signal stales late in the window.
-  momentum_exit_sec: 120
+  # 2026-06-02: raised 120→180 — research on 155k events showed <180s entries have WR=12.5%, EV=-6.98 vs EV=+6.92 at 200-180s.
+  momentum_exit_sec: 180
   # Lookback for the underlying momentum signal. 300s (one prior window) was the
   # day-stable sweet spot; 120s and 600s were NOT stable (one day negative).
   momentum_lookback_sec: 300
@@ -37,21 +38,72 @@ maker:
   # 2x on strong signals (>=0.20%). Bounded by ask depth + max_deployed.
   momentum_strong_threshold: 0.0020
   momentum_strong_mult: 2
-  # BOTH directions (user pref 2026-05-31): YES on uptrends, NO on downtrends —
-  # trade WITH the trend either way. The DOWN half is the better-performing half on
-  # the tape (BTC both-sides +10% ROI vs long-only +6.2%), so keeping it is correct.
-  momentum_long_only: false
-  # Don't chase: past ~0.80 the book has already priced the move (edge gone).
-  momentum_max_ask: 0.80
+  # Long-only: bet YES only on uptrends; skip downtrend windows entirely (no NO bets).
+  # Enabled 2026-06-01: live sessions showed DOWN trades generating more losses,
+  # overriding the tape study (+10% both-sides vs +6.2% long-only) which may not
+  # reflect current live conditions. Flip to false to re-enable both directions.
+  momentum_long_only: true
+  # CONTRARIAN experiment (user 2026-06-01): fade the trend instead of following it
+  # (up→NO, down→YES) — a bet that the regime is mean-reverting. This is the INVERSE
+  # of the validated momentum edge, so it backtests NEGATIVE on the trending tape;
+  # it's a deliberate live test of whether the current regime reverts. Flip to false
+  # to return to standard momentum.
+  momentum_contrarian: false
+  # Never enter above this ask. @savvvv enters 0.50-0.56 consistently; beyond
+  # that the book has already priced the momentum and R/R deteriorates sharply
+  # (entry at 0.57 → max gain $0.43, max loss $0.57 if it settles 0).
+  # 2026-06-02: lowered 0.57→0.52 — research showed 0.53-0.57 bucket has EV=-7.16 (avg loss -18.11 vs avg win +9.26).
+  momentum_max_ask: 0.52
+  # Take-profit: if the bid of the entry token rises above this AFTER our entry,
+  # sell to crystallize the gain instead of holding to resolution.
+  # Example: entered at 0.52, bid rises to 0.75 → sell for +$0.23/share locked.
+  # 0 = disabled (always hold to resolution, classic savvvv pattern).
+  momentum_take_profit_bid: 0.8
+  # Warmup: skip momentum entries for the first N resolved windows of each session.
+  # Lets the signal stabilise before committing capital after a cold start.
+  momentum_warmup_windows: 0
   # Base taker clip (5 sh = venue min ≈ $2.6/window/asset at ~0.52 entry; 10 on strong).
   momentum_clip_shares: 5
 
+  # ── MARTINGALE AVERAGING-DOWN (@savvvv pattern, 2026-06-01) ───────────────
+  # Extends momentum_trend: after the initial entry, if the ask drops by the
+  # thresholds below, buy more of the SAME side at successively lower prices.
+  # Each level fires once per window. ALL shares are held to resolution.
+  #
+  # ⚠️  RISK: the initial entry + all levels combined can lose the full
+  #     martingale_max_spend_usd in a single window (~4% of windows historically).
+  #     Start SMALL (see defaults) to validate live before scaling up.
+  #     Live safety backstops: cash_floor_usd, session_loss_halt_usd,
+  #     net_worth_halt_usd in the [live] section below.
+  #
+  # Disable entirely: set martingale_enabled: false (this is the default).
+  martingale_enabled: true
+  # Initial entry in USDC (replaces momentum_clip_shares when enabled).
+  # $10 initial = $300 capital ÷ 5× coverage ÷ 5 levels = conservative base.
+  martingale_initial_usdc: 10
+  # Hard cap per token per window. With L2 removed: $10+$10+$15+$10 = $45 max.
+  # Kept at 60 as a safety net in case of config drift.
+  martingale_max_spend_usd: 50
+  # No averaging when <60s remain: a sustained drop that close to resolution is
+  # the market converging to 0, not noise. Prevents the worst tail fills.
+  martingale_min_ttr_sec: 60
+  # Never buy below 0.23: the market is pricing >77% chance of loss at that point.
+  martingale_min_ask: 0.33
+  # Averaging levels — @savvvv empirical drops: ~0.08, ~0.15, ~0.22.
+  martingale_levels:
+    - price_drop: 0.08    # add when ask is 8¢ below entry (e.g. 0.52 → 0.44)
+      add_usdc: 10
+    - price_drop: 0.15    # add when ask is 15¢ below entry (e.g. 0.52 → 0.37)
+      add_usdc: 15
+    - price_drop: 0.30    # deep averaging: 30¢ drop (e.g. 0.52 → 0.22)
+      add_usdc: 10
+
   # ── FAVORITE HARVESTER (legacy, disabled — superseded by momentum_trend) ──
   favorite_harvester: false
-  harvest_enter_sec: 90
+  harvest_enter_sec: 120
   harvest_exit_sec: 30
-  harvest_min_mid: 0.60
-  harvest_max_ask: 0.85
+  harvest_min_mid: 0.57
+  harvest_max_ask: 0.80
   harvest_clip_shares: 5
 
   # ── Shared knobs (still parsed; the maker quote/flatten phases are bypassed
@@ -91,8 +143,8 @@ maker:
   taker_fee_rate: 0.07
 
 risk:
-  daily_loss_limit_usd: 15.0
-  max_committed_usd: 12.0
+  daily_loss_limit_usd: 60.0
+  max_committed_usd: 60.0
 
 live:
   # ⚠️ THIS is the real-vs-paper switch (NOT the DRY_RUN env var, which only gets
@@ -100,26 +152,26 @@ live:
   # enabled:false = paper: the loop runs and logs harvest intent + shadow P&L but
   # places NO orders. Set to true ONLY when you deliberately want live trading.
   enabled: true
-  # BTC only for now (user pref 2026-05-31, one asset at a time). NOTE: in the tape
-  # BTC was the WEAKEST of the 6 (+6.2% long-only vs +17% pooled), and a single
-  # asset = no diversification = higher variance (~10-12 windows/hr, fewer with
-  # long-only). Add ETH/XRP/SOL later for a smoother curve.
+  # BTC + ETH (2026-06-01 scale-up with $300 capital). ETH has similar
+  # momentum autocorrelation and high liquidity. Adds ~10 extra windows/hr
+  # for a smoother PnL curve. Add XRP/SOL/BNB/DOGE later.
   assets: [BTC]
-  # 1 asset × up to 10 sh (strong) × ~$0.55 ≈ $5.5; 10 gives headroom.
-  max_deployed_usd: 10
-  # ⚠️ HALT SIZING TRADEOFF: each loss is ~$2.6 (5 sh × ~0.52). The strategy wins
-  # ~65% but has variance — a $5 halt would trip on 2 normal early losses and never
-  # let the edge compound. $10 daily / $20 session gives room to ride variance while
-  # bounding the downside. Raise/lower to YOUR risk tolerance.
-  daily_loss_halt_usd: 10
-  session_loss_halt_usd: 20
-  poll_interval_ms: 750
-  reconcile_every_sec: 2
+  # 2 assets × up to $60/window = $120 max simultaneous deployment.
+  max_deployed_usd: 60
+  # ⚠️ HALT SIZING for $300 capital with 5× coverage ($60/window):
+  # $60 halt ≈ 1 full worst-case window — bot stops after cumulative $60 real loss.
+  # net_worth_halt (real wallet) is the primary backstop.
+  daily_loss_halt_usd: 60
+  session_loss_halt_usd: 60
+  poll_interval_ms: 300
+  reconcile_every_sec: 30
   reconcile_correct: true
   reconcile_min_persist_ms: 60000
-  cash_floor_usd: 5
-  net_worth_halt_usd: 30
-  # ~50 resolved windows ≈ 8/asset — a meaningful batch to judge the live edge.
-  session_max_windows: 50
+  cash_floor_usd: 15
+  # ⚠️ PRIMARY real-money cap. Reads real wallet vs session-start balance.
+  # $60 = 1× max window exposure — hard stop after cumulative $60 real-wallet drop.
+  net_worth_halt_usd: 60
+  # Stop after 150 resolved windows (~7-8h at 20 windows/hr with BTC+ETH).
+  session_max_windows: 40
   session_take_profit_usd: 0
   session_max_consec_losses: 0     # disabled: momentum clusters losses in choppy patches; rely on $ halts
